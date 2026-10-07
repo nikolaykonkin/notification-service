@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+// Пакет proto: версия v1 в имени позволяет позже выпустить v2 без поломки клиентов
+package notification.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Путь импорта Go-пакета и его имя (после точки с запятой)
+option go_package = "github.com/nikolaykonkin/notification-service/proto/notification/v1;notificationv1";
+
+// NotificationService принимает события и отдает статус уведомлений
+service NotificationService {
+  // SendNotification принимает событие и ставит уведомление в очередь на отправку
+  rpc SendNotification(SendNotificationRequest) returns (SendNotificationResponse);
+
+  // GetNotification возвращает уведомление по id (сначала из кэша, затем из БД)
+  rpc GetNotification(GetNotificationRequest) returns (GetNotificationResponse);
+}
+
+// Тип уведомления определяет топик Kafka: email или push
+enum NotificationType {
+  NOTIFICATION_TYPE_UNSPECIFIED = 0; // значение по умолчанию: клиент забыл указать тип
+  NOTIFICATION_TYPE_EMAIL = 1;
+  NOTIFICATION_TYPE_PUSH = 2;
+}
+
+// Статус жизненного цикла уведомления
+enum NotificationStatus {
+  NOTIFICATION_STATUS_UNSPECIFIED = 0;
+  NOTIFICATION_STATUS_PENDING = 1; // принято, еще не отправлено
+  NOTIFICATION_STATUS_SENT = 2;    // успешно отправлено
+  NOTIFICATION_STATUS_FAILED = 3;  // отправка не удалась
+}
+
+// Notification описывает уведомление целиком
+message Notification {
+  string id = 1;
+  int64 user_id = 2;
+  NotificationType type = 3;
+  NotificationStatus status = 4;
+  string payload = 5; // содержимое уведомления (JSON как текст)
+  string error = 6;   // причина ошибки, если status = FAILED
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message SendNotificationRequest {
+  int64 user_id = 1;
+  NotificationType type = 2;
+  string payload = 3;
+}
+
+message SendNotificationResponse {
+  string id = 1;
+  NotificationStatus status = 2;
+}
+
+message GetNotificationRequest {
+  string id = 1;
+}
+
+message GetNotificationResponse {
+  Notification notification = 1;
+}
