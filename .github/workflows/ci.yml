@@ -1,0 +1,34 @@
+name: CI
+
+# Запуск на push в main и на любые pull request
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Минимальные права: токен может только читать репозиторий
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          # Версия Go берется из go.mod: единый источник
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race detector)
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
