@@ -38,3 +38,13 @@ test-race:
 .PHONY: vet
 vet:
 	go vet ./...
+# Поднять локальную инфраструктуру (PostgreSQL, Redis, Kafka) в фоне
+.PHONY: docker-up
+docker-up:
+	docker compose up -d
+
+# Остановить и удалить контейнеры (данные PostgreSQL сохраняются в томе)
+# Чтобы удалить и данные: docker compose down -v
+.PHONY: docker-down
+docker-down:
+	docker compose down
