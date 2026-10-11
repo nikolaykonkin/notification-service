@@ -42,7 +42,7 @@ func New(store StatusUpdater, cache CacheInvalidator, sender Sender, log *slog.L
 // не удалось сохранить статус: consumer в этом случае не зафиксирует offset, и событие придет снова
 func (p *Processor) Handle(ctx context.Context, e kafka.Event) error {
 	// 1. Эмулируем отправку - неудачная отправка это нормальный результат, а не ошибка сервиса:
-    //    записываем статус failed и причину, повторять событие не нужно
+	//    записываем статус failed и причину, повторять событие не нужно
 	status, errMsg := storage.StatusSent, ""
 	if err := p.sender.Send(ctx, e); err != nil {
 		if ctx.Err() != nil {
