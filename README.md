@@ -14,16 +14,16 @@
 - Redis: кеш уведомлений по id с TTL (`internal/cache`) и rate limiting по `user_id` (`internal/ratelimit`, fixed window на `INCR` + `EXPIRE NX` в одной транзакции).
 - Kafka producer (`internal/kafka`): публикует событие в топик `notifications.email` или `notifications.push` по типу уведомления. Ключ сообщения `user_id`, поэтому события одного пользователя идут в одну партицию и сохраняют порядок. Запись синхронная, подтверждается всеми репликами.
 - Kafka consumer (`internal/kafka`): читает оба топика в составе consumer group. Гарантия доставки at-least-once: offset фиксируется после обработки, поэтому при сбое событие может прийти повторно. Некорректные сообщения логируются и пропускаются. Если обработчик вернул ошибку, consumer останавливается без фиксации offset.
+- Проверка доступности Kafka на старте (`kafka.Ping`): TCP-подключение хотя бы к одному брокеру.
 - Обработка события (`internal/processor`): эмуляция отправки (пауза), запись статуса `sent` или `failed` в PostgreSQL и удаление записи из кеша. Ошибка отправки сохраняется как статус `failed`, сбой кеша только логируется.
 - gRPC-сервер (`internal/api`): `SendNotification` проверяет запрос и лимит (при сбое Redis пропускает запрос), сохраняет уведомление со статусом `pending` в PostgreSQL и публикует событие в Kafka; если публикация не удалась, запись помечается `failed`. `GetNotification` читает из кеша, а при промахе или сбое кеша из PostgreSQL. Внутренние ошибки клиенту не раскрываются. Покрыт тестами через bufconn.
+- Сборка и запуск (`cmd/notification-service`): зависимости собираются через конструкторы, при старте проверяются PostgreSQL, Redis и Kafka (таймаут 15 секунд). Graceful shutdown по SIGINT и SIGTERM: сначала останавливается gRPC-сервер (ожидание текущих запросов до 5 секунд, затем принудительно), затем consumer, producer, Redis и PostgreSQL. Если consumer или gRPC-сервер падают сами, процесс завершается с кодом 1.
 - Docker Compose с PostgreSQL 17, Redis 7 и Kafka 3.9 в режиме KRaft. Одноразовый контейнер `kafka-init` создает топики `notifications.email` и `notifications.push`.
 - CI на GitHub Actions: `go vet`, `go test -race`, `go build`.
 
-Что это значит на практике: сервис пока не запускается как приложение. `main.go` только загружает конфигурацию, пишет лог и завершается. Producer, consumer, процессор и gRPC-сервер написаны и покрыты тестами, но между собой не соединены, gRPC-сервер не слушает порт и ничего из этого не запускается из `main.go`. Работают и проверяются тестами отдельные пакеты и локальная инфраструктура. Все остальное перечислено в разделе Roadmap.
+Что это значит на практике: сервис запускается командой `make run` вместе с локальной инфраструктурой и принимает gRPC-вызовы на порту `GRPC_PORT`. HTTP-сервера (`/health`, `/metrics`) пока нет, переменная `HTTP_PORT` не используется. Docker-образа сервиса нет. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
 
 ## Архитектура
-
-Целевая схема (в коде сейчас есть только отдельные пакеты `config`, `storage`, `cache`, `ratelimit`, `kafka`, `processor` и `api`; между собой они не соединены, сборки в `main.go` еще нет).
 
 Сервис это один процесс: gRPC-сервер, producer и consumer живут в нем вместе (пакеты `internal/api` и `internal/kafka`). Consumer только читает сообщения и передает их обработчику, а сама обработка вынесена в `internal/processor`. Kafka, Redis и PostgreSQL внешние системы, а Kafka здесь только транспорт между producer и consumer одного и того же сервиса.
 
@@ -75,12 +75,12 @@
 
 ```
 .
-├── cmd/notification-service/   точка входа (пока только загрузка конфигурации)
+├── cmd/notification-service/   точка входа: сборка зависимостей, запуск, graceful shutdown (готово)
 ├── internal/
 │   ├── api/                    gRPC-сервер (готово)
 │   ├── cache/                  кеш уведомлений в Redis (готово)
 │   ├── config/                 конфигурация из env (готово)
-│   ├── kafka/                  producer и consumer (готово)
+│   ├── kafka/                  producer, consumer, проверка доступности (готово)
 │   ├── metrics/                метрики Prometheus (пока только doc.go)
 │   ├── processor/              обработка события: отправка, статус, сброс кеша (готово)
 │   ├── ratelimit/              rate limiting на Redis (готово)
@@ -111,6 +111,24 @@ docker compose ps -a
 
 Миграция из `migrations/` выполняется автоматически, но только при первом запуске на пустой базе. Чтобы применить ее заново, пересоздайте том: `docker compose down -v`, затем `make docker-up`.
 
+Запустить сервис (останавливается по Ctrl+C):
+
+```bash
+make run
+```
+
+Вызвать сервис через [grpcurl](https://github.com/fullstorydev/grpcurl) (в другом терминале):
+
+```bash
+grpcurl -plaintext localhost:50051 list
+grpcurl -plaintext -d '{"user_id": 42, "type": "NOTIFICATION_TYPE_EMAIL", "payload": "{\"to\":\"user@example.com\"}"}' \
+  localhost:50051 notification.v1.NotificationService/SendNotification
+grpcurl -plaintext -d '{"id": "<id из ответа>"}' \
+  localhost:50051 notification.v1.NotificationService/GetNotification
+```
+
+Сразу после отправки статус `NOTIFICATION_STATUS_PENDING`, примерно через секунду `NOTIFICATION_STATUS_SENT`. Лимит по умолчанию 10 уведомлений в час на пользователя (`RATE_LIMIT_PER_HOUR`), сверх лимита сервис отвечает `ResourceExhausted`.
+
 Запустить тесты:
 
 ```bash
@@ -129,12 +147,6 @@ make test-race
 
 Тесты Kafka идут заметно дольше остальных: consumer ждет вступления в группу. Топики общие, поэтому каждый тест ищет в них сообщения со своим уникальным id.
 
-Проверить загрузку конфигурации (сервис загрузит настройки из `.env`, запишет лог и завершится):
-
-```bash
-make run
-```
-
 Остановить инфраструктуру:
 
 ```bash
@@ -147,7 +159,6 @@ Workflow `.github/workflows/ci.yml` запускается на push в `main` �
 
 ## Roadmap
 
-- `main.go`: сборка зависимостей и graceful shutdown
 - Метрики Prometheus, `/metrics` и `/health`
 - Dockerfile сервиса, Prometheus и Grafana в Docker Compose
 - Интеграционные тесты
