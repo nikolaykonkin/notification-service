@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/nikolaykonkin/notification-service/internal/kafka"
 	"github.com/nikolaykonkin/notification-service/internal/storage"
@@ -24,23 +25,31 @@ type CacheInvalidator interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// Recorder принимает результат обработки для метрик
+// Реализация лежит в пакете metrics: процессор ничего не знает о Prometheus
+type Recorder interface {
+	Processed(typ storage.Type, status storage.Status, d time.Duration)
+}
+
 // Processor обрабатывает одно событие целиком
 type Processor struct {
 	store  StatusUpdater
 	cache  CacheInvalidator
 	sender Sender
+	rec    Recorder
 	log    *slog.Logger
 }
 
 // New создает процессор
-func New(store StatusUpdater, cache CacheInvalidator, sender Sender, log *slog.Logger) *Processor {
-	return &Processor{store: store, cache: cache, sender: sender, log: log}
+func New(store StatusUpdater, cache CacheInvalidator, sender Sender, rec Recorder, log *slog.Logger) *Processor {
+	return &Processor{store: store, cache: cache, sender: sender, rec: rec, log: log}
 }
 
 // Handle обрабатывает событие
 // Возвращает ошибку только тогда, когда обработку нельзя считать завершенной, например,
 // не удалось сохранить статус: consumer в этом случае не зафиксирует offset, и событие придет снова
 func (p *Processor) Handle(ctx context.Context, e kafka.Event) error {
+	start := time.Now()
 	// 1. Эмулируем отправку - неудачная отправка это нормальный результат, а не ошибка сервиса:
 	//    записываем статус failed и причину, повторять событие не нужно
 	status, errMsg := storage.StatusSent, ""
@@ -62,6 +71,10 @@ func (p *Processor) Handle(ctx context.Context, e kafka.Event) error {
 	case err != nil:
 		return fmt.Errorf("сохранение статуса %q для %s: %w", status, e.ID, err)
 	}
+
+	// Метрики фиксируем только тогда, когда итог сохранен: событие, которое придет
+	// снова (ошибка записи) или было пропущено, ни отправленным, ни проваленным не считается
+	p.rec.Processed(e.Type, status, time.Since(start))
 
 	// 3. Сбрасываем кэш, чтобы читатели не видели устаревший статус pending
 	//    Сбой кэша не критичен: запись исчезнет сама по TTL

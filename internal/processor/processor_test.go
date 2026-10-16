@@ -42,9 +42,30 @@ type fakeSender struct{ err error }
 
 func (f fakeSender) Send(context.Context, kafka.Event) error { return f.err }
 
+// Заглушка для метрик
+// Запоминает все вызовы Processed
+
+type recorded struct {
+	typ    storage.Type
+	status storage.Status
+	d      time.Duration
+}
+
+type fakeRecorder struct{ calls []recorded }
+
+func (f *fakeRecorder) Processed(typ storage.Type, status storage.Status, d time.Duration) {
+	f.calls = append(f.calls, recorded{typ, status, d})
+}
+
+// newProcessor создает процессор с заглушкой метрик, которую тест не проверяет
 func newProcessor(store *fakeStore, cache *fakeCache, sender Sender) *Processor {
+	return newProcessorWithRecorder(store, cache, sender, &fakeRecorder{})
+}
+
+// То же самое, но заглушку метрик передает сам тест
+func newProcessorWithRecorder(store *fakeStore, cache *fakeCache, sender Sender, rec Recorder) *Processor {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(store, cache, sender, log)
+	return New(store, cache, sender, rec, log)
 }
 
 var testEvent = kafka.Event{ID: "n-1", UserID: 7, Type: storage.TypeEmail}
@@ -127,6 +148,63 @@ func TestHandle_ContextCancelledDoesNotTouchStatus(t *testing.T) {
 	}
 	if store.calls != 0 {
 		t.Errorf("статус не должен меняться при остановке, вызовов: %d", store.calls)
+	}
+}
+
+// Тесты метрик
+
+func TestHandle_RecordsSent(t *testing.T) {
+	rec := &fakeRecorder{}
+	p := newProcessorWithRecorder(&fakeStore{}, &fakeCache{}, fakeSender{}, rec)
+
+	if err := p.Handle(context.Background(), testEvent); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("ожидалась одна запись метрики, получено %d", len(rec.calls))
+	}
+	if c := rec.calls[0]; c.typ != storage.TypeEmail || c.status != storage.StatusSent || c.d < 0 {
+		t.Errorf("неверная запись метрики: %+v", c)
+	}
+}
+
+func TestHandle_RecordsFailedSend(t *testing.T) {
+	rec := &fakeRecorder{}
+	p := newProcessorWithRecorder(&fakeStore{}, &fakeCache{}, fakeSender{err: errors.New("smtp timeout")}, rec)
+
+	if err := p.Handle(context.Background(), testEvent); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].status != storage.StatusFailed {
+		t.Errorf("ожидалась одна запись со статусом failed, получено %+v", rec.calls)
+	}
+}
+
+func TestHandle_NoRecordWhenNotCompleted(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name   string
+		store  *fakeStore
+		sender Sender
+		ctx    context.Context
+	}{
+		{"сбой записи в базу", &fakeStore{err: errors.New("db down")}, fakeSender{}, context.Background()},
+		{"уведомление не найдено", &fakeStore{err: storage.ErrNotFound}, fakeSender{}, context.Background()},
+		{"остановка сервиса", &fakeStore{}, fakeSender{err: context.Canceled}, cancelled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &fakeRecorder{}
+			p := newProcessorWithRecorder(tt.store, &fakeCache{}, tt.sender, rec)
+
+			_ = p.Handle(tt.ctx, testEvent)
+
+			if len(rec.calls) != 0 {
+				t.Errorf("метрика не должна записываться, получено %+v", rec.calls)
+			}
+		})
 	}
 }
 
