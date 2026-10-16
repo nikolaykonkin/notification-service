@@ -3,10 +3,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,7 +20,9 @@ import (
 	"github.com/nikolaykonkin/notification-service/internal/api"
 	"github.com/nikolaykonkin/notification-service/internal/cache"
 	"github.com/nikolaykonkin/notification-service/internal/config"
+	"github.com/nikolaykonkin/notification-service/internal/httpserver"
 	"github.com/nikolaykonkin/notification-service/internal/kafka"
+	"github.com/nikolaykonkin/notification-service/internal/metrics"
 	"github.com/nikolaykonkin/notification-service/internal/processor"
 	"github.com/nikolaykonkin/notification-service/internal/ratelimit"
 	"github.com/nikolaykonkin/notification-service/internal/storage"
@@ -32,9 +36,13 @@ const (
 	sendDelay = 500 * time.Millisecond
 	// startupTimeout ограничивает подключение к PostgreSQL, Redis и Kafka на старте
 	startupTimeout = 15 * time.Second
-	// grpcStopTimeout это время, которое gRPC-сервер ждет завершения текущих запросов
-	// Docker после SIGTERM ждет 10 секунд и затем убивает процесс, поэтому укладываемся в меньшее
+	// healthCheckTimeout это общее время на проверки зависимостей в /health
+	healthCheckTimeout = 2 * time.Second
+	// grpcStopTimeout и httpStopTimeout это время, которое серверы ждут завершения текущих запросов
+	// Docker после SIGTERM ждет 10 секунд и затем убивает процесс,
+	// поэтому в сумме (5 + 2) укладываемся в меньшее
 	grpcStopTimeout = 5 * time.Second
+	httpStopTimeout = 2 * time.Second
 )
 
 func main() {
@@ -76,12 +84,12 @@ func main() {
 	slog.Info("сервис остановлен")
 }
 
-// run собирает зависимости (composition root), запускает consumer и gRPC-сервер
+// run собирает зависимости (composition root), запускает consumer, gRPC- и HTTP-серверы
 // и ждет сигнала остановки или падения компонента
 //
 // Компоненты создаются в порядке зависимостей, и сразу после создания регистрируется defer
 // Defer выполняются в обратном порядке, поэтому остановка идет в порядке, обратном запуску:
-// gRPC-сервер, consumer, producer, Redis, PostgreSQL
+// HTTP-сервер, gRPC-сервер, consumer, producer, Redis, PostgreSQL
 // Закрытие работает и при ошибке запуска
 func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// 1. Внешние системы
@@ -109,6 +117,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 
 	// 2. Компоненты
+	m := metrics.New()
 	repo := storage.NewRepository(pool)
 	notificationCache := cache.NewNotificationCache(redisClient, cache.DefaultTTL)
 	limiter := ratelimit.New(redisClient, cfg.RateLimitPerHour, ratelimit.DefaultWindow)
@@ -116,8 +125,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	producer := kafka.NewProducer(cfg.KafkaBrokers)
 	defer closeLog(log, "Kafka producer", producer)
 
-	// 3. Consumer: читает события и передает их процессору
-	proc := processor.New(repo, notificationCache, processor.SimulatedSender{Delay: sendDelay}, log)
+	// 3. Consumer: читает события и передает их процессору, который пишет метрики в m
+	proc := processor.New(repo, notificationCache, processor.SimulatedSender{Delay: sendDelay}, m, log)
 	consumer := kafka.NewConsumer(cfg.KafkaBrokers, consumerGroup, proc, log)
 
 	consumerCtx, cancelConsumer := context.WithCancel(ctx)
@@ -131,7 +140,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 
 	// 4. gRPC-сервер
 	// Порт занимаем сразу: если он занят, узнаем об этом на старте
-	lis, err := net.Listen("tcp", cfg.GRPCAddr())
+	grpcLis, err := net.Listen("tcp", cfg.GRPCAddr())
 	if err != nil {
 		return fmt.Errorf("прослушивание %s: %w", cfg.GRPCAddr(), err)
 	}
@@ -143,16 +152,46 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// В реальной эксплуатации его обычно отключают, потому что сервер раскрывает свою схему
 	reflection.Register(grpcServer)
 
-	grpcTask := startTask(func() error { return grpcServer.Serve(lis) })
+	grpcTask := startTask(func() error { return grpcServer.Serve(grpcLis) })
 	defer func() {
 		stopGRPC(grpcServer, grpcStopTimeout, log)
 		<-grpcTask.done
 		log.Info("остановлен", "component", "gRPC-сервер")
 	}()
 
-	log.Info("сервис запущен", "grpc_addr", cfg.GRPCAddr(), "consumer_group", consumerGroup)
+	// 5. HTTP-сервер: /metrics для Prometheus и /health для проверки состояния
+	httpLis, err := net.Listen("tcp", cfg.HTTPAddr())
+	if err != nil {
+		return fmt.Errorf("прослушивание %s: %w", cfg.HTTPAddr(), err)
+	}
 
-	// 5. Ждем сигнала остановки или падения одного из компонентов
+	checks := []httpserver.Check{
+		{Name: "postgresql", Fn: pool.Ping},
+		{Name: "redis", Fn: func(ctx context.Context) error { return redisClient.Ping(ctx).Err() }},
+	}
+	httpSrv := httpserver.NewServer(httpserver.NewHandler(m.Handler(), checks, healthCheckTimeout, log))
+
+	httpTask := startTask(func() error {
+		// ErrServerClosed это штатный результат Shutdown, а не ошибка
+		err := httpSrv.Serve(httpLis)
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	})
+	defer func() {
+		stopHTTP(httpSrv, httpStopTimeout, log)
+		<-httpTask.done
+		log.Info("остановлен", "component", "HTTP-сервер")
+	}()
+
+	log.Info("сервис запущен",
+		"grpc_addr", cfg.GRPCAddr(),
+		"http_addr", cfg.HTTPAddr(),
+		"consumer_group", consumerGroup,
+	)
+
+	// 6. Ждем сигнала остановки или падения одного из компонентов
 	select {
 	case <-ctx.Done():
 		log.Info("получен сигнал остановки, начинаем graceful shutdown")
@@ -167,6 +206,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			return nil
 		}
 		return stopReason("gRPC-сервер", grpcTask.err)
+	case <-httpTask.done:
+		if ctx.Err() != nil {
+			return nil
+		}
+		return stopReason("HTTP-сервер", httpTask.err)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
@@ -121,5 +122,65 @@ func TestStopGRPC_ForcesStopWhenStreamStaysOpen(t *testing.T) {
 	}
 	if _, err := stream.Recv(); err == nil {
 		t.Error("стрим должен быть закрыт после остановки сервера")
+	}
+}
+
+// startHTTPServer запускает http.Server на свободном порту локального интерфейса
+func startHTTPServer(t *testing.T, h http.Handler) (*http.Server, string) {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: time.Second}
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	return srv, "http://" + lis.Addr().String()
+}
+
+func TestStopHTTP_GracefulWhenIdle(t *testing.T) {
+	srv, _ := startHTTPServer(t, http.NotFoundHandler())
+
+	begin := time.Now()
+	stopHTTP(srv, 5*time.Second, discardLogger())
+
+	if elapsed := time.Since(begin); elapsed > time.Second {
+		t.Errorf("остановка простаивающего сервера заняла %v", elapsed)
+	}
+}
+
+func TestStopHTTP_ForcesCloseWhenRequestHangs(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	srv, url := startHTTPServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(started)
+		<-release // запрос зависает до конца теста
+	}))
+
+	go func() {
+		if resp, err := http.Get(url); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("запрос не дошел до обработчика")
+	}
+
+	const timeout = 200 * time.Millisecond
+	begin := time.Now()
+	stopHTTP(srv, timeout, discardLogger())
+	elapsed := time.Since(begin)
+
+	if elapsed < timeout {
+		t.Errorf("остановка заняла %v: сервер не дождался таймаута", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("остановка заняла %v: принудительное закрытие не сработало", elapsed)
 	}
 }

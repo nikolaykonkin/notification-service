@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"google.golang.org/grpc"
@@ -46,5 +48,19 @@ func stopGRPC(srv *grpc.Server, timeout time.Duration, log *slog.Logger) {
 		log.Warn("gRPC-запросы не завершились вовремя, остановка принудительная", "timeout", timeout)
 		srv.Stop()
 		<-done // Stop прерывает ожидание в GracefulStop
+	}
+}
+
+// stopHTTP останавливает HTTP-сервер аккуратно: перестает принимать новые соединения
+// и ждет завершения текущих запросов, а по истечении timeout закрывает все соединения
+// Контекст создаем из Background: сигнальный контекст к этому моменту уже отменен,
+// и Shutdown вернулся бы сразу, никого не дождавшись
+func stopHTTP(srv *http.Server, timeout time.Duration, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Warn("HTTP-запросы не завершились вовремя, остановка принудительная", "timeout", timeout)
+		_ = srv.Close()
 	}
 }

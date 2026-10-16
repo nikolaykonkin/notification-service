@@ -15,17 +15,19 @@
 - Kafka producer (`internal/kafka`): публикует событие в топик `notifications.email` или `notifications.push` по типу уведомления. Ключ сообщения `user_id`, поэтому события одного пользователя идут в одну партицию и сохраняют порядок. Запись синхронная, подтверждается всеми репликами.
 - Kafka consumer (`internal/kafka`): читает оба топика в составе consumer group. Гарантия доставки at-least-once: offset фиксируется после обработки, поэтому при сбое событие может прийти повторно. Некорректные сообщения логируются и пропускаются. Если обработчик вернул ошибку, consumer останавливается без фиксации offset.
 - Проверка доступности Kafka на старте (`kafka.Ping`): TCP-подключение хотя бы к одному брокеру.
-- Обработка события (`internal/processor`): эмуляция отправки (пауза), запись статуса `sent` или `failed` в PostgreSQL и удаление записи из кеша. Ошибка отправки сохраняется как статус `failed`, сбой кеша только логируется.
+- Обработка события (`internal/processor`): эмуляция отправки (пауза), запись статуса `sent` или `failed` в PostgreSQL и удаление записи из кеша. Ошибка отправки сохраняется как статус `failed`, сбой кеша только логируется. Результат передается в метрики через интерфейс `Recorder`.
 - gRPC-сервер (`internal/api`): `SendNotification` проверяет запрос и лимит (при сбое Redis пропускает запрос), сохраняет уведомление со статусом `pending` в PostgreSQL и публикует событие в Kafka; если публикация не удалась, запись помечается `failed`. `GetNotification` читает из кеша, а при промахе или сбое кеша из PostgreSQL. Внутренние ошибки клиенту не раскрываются. Покрыт тестами через bufconn.
-- Сборка и запуск (`cmd/notification-service`): зависимости собираются через конструкторы, при старте проверяются PostgreSQL, Redis и Kafka (таймаут 15 секунд). Graceful shutdown по SIGINT и SIGTERM: сначала останавливается gRPC-сервер (ожидание текущих запросов до 5 секунд, затем принудительно), затем consumer, producer, Redis и PostgreSQL. Если consumer или gRPC-сервер падают сами, процесс завершается с кодом 1.
+- Метрики Prometheus (`internal/metrics`): отдельный реестр, счетчики `notifications_sent_total` и `notifications_failed_total`, гистограмма `notification_duration_seconds` (метка `type`: `email`, `push` или `unknown`), стандартные метрики Go и процесса.
+- HTTP-сервер (`internal/httpserver`): `GET /metrics` для Prometheus и `GET /health`, который проверяет PostgreSQL и Redis (общий таймаут 2 секунды) и отвечает 200 или 503 без раскрытия текста ошибок. Заданы таймауты чтения и записи.
+- Сборка и запуск (`cmd/notification-service`): зависимости собираются через конструкторы, при старте проверяются PostgreSQL, Redis и Kafka (таймаут 15 секунд). Graceful shutdown по SIGINT и SIGTERM: сначала останавливаются HTTP-сервер (до 2 секунд) и gRPC-сервер (до 5 секунд), затем consumer, producer, Redis и PostgreSQL. Если consumer или один из серверов падают сами, процесс завершается с кодом 1.
 - Docker Compose с PostgreSQL 17, Redis 7 и Kafka 3.9 в режиме KRaft. Одноразовый контейнер `kafka-init` создает топики `notifications.email` и `notifications.push`.
 - CI на GitHub Actions: `go vet`, `go test -race`, `go build`.
 
-Что это значит на практике: сервис запускается командой `make run` вместе с локальной инфраструктурой и принимает gRPC-вызовы на порту `GRPC_PORT`. HTTP-сервера (`/health`, `/metrics`) пока нет, переменная `HTTP_PORT` не используется. Docker-образа сервиса нет. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
+Что это значит на практике: сервис запускается командой `make run` вместе с локальной инфраструктурой, принимает gRPC-вызовы на порту `GRPC_PORT` и отдает `/metrics` и `/health` на порту `HTTP_PORT`. Prometheus и Grafana в Docker Compose пока не подняты, метрики можно посмотреть через `curl`. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем. Docker-образа сервиса нет. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
 
 ## Архитектура
 
-Сервис это один процесс: gRPC-сервер, producer и consumer живут в нем вместе (пакеты `internal/api` и `internal/kafka`). Consumer только читает сообщения и передает их обработчику, а сама обработка вынесена в `internal/processor`. Kafka, Redis и PostgreSQL внешние системы, а Kafka здесь только транспорт между producer и consumer одного и того же сервиса.
+Сервис это один процесс: gRPC-сервер, HTTP-сервер (`/metrics`, `/health`), producer и consumer живут в нем вместе (пакеты `internal/api`, `internal/httpserver`, `internal/kafka`). Consumer только читает сообщения и передает их обработчику, а сама обработка вынесена в `internal/processor`. Kafka, Redis и PostgreSQL внешние системы, а Kafka здесь только транспорт между producer и consumer одного и того же сервиса.
 
 ```
 Отправка:
@@ -66,10 +68,11 @@
 - PostgreSQL 17, драйвер pgx
 - Redis 7, клиент go-redis
 - Kafka 3.9 (KRaft, без ZooKeeper), клиент kafka-go
+- Prometheus client_golang (метрики)
 - Docker, Docker Compose
 - GitHub Actions
 
-Планируется: Prometheus, Grafana, Dockerfile сервиса, публикация образа в ghcr.io.
+Планируется: Prometheus (сервер), Grafana, Dockerfile сервиса, публикация образа в ghcr.io.
 
 ## Структура проекта
 
@@ -80,8 +83,9 @@
 │   ├── api/                    gRPC-сервер (готово)
 │   ├── cache/                  кеш уведомлений в Redis (готово)
 │   ├── config/                 конфигурация из env (готово)
+│   ├── httpserver/             HTTP: /metrics и /health (готово)
 │   ├── kafka/                  producer, consumer, проверка доступности (готово)
-│   ├── metrics/                метрики Prometheus (пока только doc.go)
+│   ├── metrics/                метрики Prometheus (готово)
 │   ├── processor/              обработка события: отправка, статус, сброс кеша (готово)
 │   ├── ratelimit/              rate limiting на Redis (готово)
 │   └── storage/                репозиторий PostgreSQL (готово)
@@ -129,6 +133,15 @@ grpcurl -plaintext -d '{"id": "<id из ответа>"}' \
 
 Сразу после отправки статус `NOTIFICATION_STATUS_PENDING`, примерно через секунду `NOTIFICATION_STATUS_SENT`. Лимит по умолчанию 10 уведомлений в час на пользователя (`RATE_LIMIT_PER_HOUR`), сверх лимита сервис отвечает `ResourceExhausted`.
 
+Проверить состояние и метрики:
+
+```bash
+curl -s localhost:8080/health
+curl -s localhost:8080/metrics | grep notification
+```
+
+`/health` отвечает 200 и `{"status":"ok",...}`, если PostgreSQL и Redis отвечают, иначе 503.
+
 Запустить тесты:
 
 ```bash
@@ -159,7 +172,6 @@ Workflow `.github/workflows/ci.yml` запускается на push в `main` �
 
 ## Roadmap
 
-- Метрики Prometheus, `/metrics` и `/health`
 - Dockerfile сервиса, Prometheus и Grafana в Docker Compose
 - Интеграционные тесты
 - CD: сборка Docker-образа в CI и публикация в ghcr.io
