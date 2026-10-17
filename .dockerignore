@@ -1,0 +1,16 @@
+# Контроль версий, CI и редакторы
+.git
+.github
+.idea
+.vscode
+.DS_Store
+
+# Локальные артефакты и секреты: .env не должен попасть в образ
+bin
+.env
+
+# Файлы, которые не нужны для сборки
+*.md
+docker-compose.yml
+monitoring
+migrations
