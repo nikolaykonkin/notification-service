@@ -1,4 +1,4 @@
-# Локальная инфраструктура для разработки: PostgreSQL, Redis, Kafka
+# Локальный стенд: PostgreSQL, Redis, Kafka и сервис
 # Пароли ниже подходят только для локальной учебной среды
 name: notification-service
 
@@ -81,6 +81,40 @@ services:
         set -e
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic notifications.email --partitions 3 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic notifications.push --partitions 3 --replication-factor 1
+
+  # Сам сервис, собирается из Dockerfile
+  # Внутри compose адреса других сервисов это имена сервисов
+  # Kafka доступна как kafka:19092 (listener INTERNAL)
+  notification-service:
+    build: .
+    image: notification-service:local
+    environment:
+      DATABASE_URL: "postgres://notification:notification@postgres:5432/notification?sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      KAFKA_BROKERS: "kafka:19092"
+      GRPC_PORT: "50051"
+      HTTP_PORT: "8080"
+      RATE_LIMIT_PER_HOUR: "10"
+    ports:
+      - "50051:50051"
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    # Если процесс завершился с ошибкой (например, упал consumer), Docker поднимет его заново
+    restart: unless-stopped
 
 volumes:
   pgdata:

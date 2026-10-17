@@ -20,6 +20,8 @@ build:
 	go build -o $(BIN) ./cmd/notification-service
 
 # Запуск с настройками из .env (set -a экспортирует все переменные из файла)
+# Если сервис уже запущен в Docker Compose, сначала остановите его (порты заняты):
+#   docker compose stop notification-service
 .PHONY: run
 run:
 	@set -a; . ./.env; set +a; go run ./cmd/notification-service
@@ -38,10 +40,11 @@ test-race:
 .PHONY: vet
 vet:
 	go vet ./...
-# Поднять локальную инфраструктуру (PostgreSQL, Redis, Kafka) в фоне
+
+# Поднять инфраструктуру и сервис в фоне (образ сервиса пересобирается)
 .PHONY: docker-up
 docker-up:
-	docker compose up -d
+	docker compose up -d --build
 
 # Остановить и удалить контейнеры (данные PostgreSQL сохраняются в томе)
 # Чтобы удалить и данные: docker compose down -v
