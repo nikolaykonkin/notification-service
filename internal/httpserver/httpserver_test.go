@@ -67,8 +67,6 @@ func TestHealth_FailingCheckReturns503(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("код ответа: получено %d, ожидался 503", rec.Code)
 	}
-	resp := decodeHealth(t, httptest.NewRecorder()) // заглушка, чтобы не читать тело дважды
-	_ = resp
 
 	body := rec.Body.String()
 	// Подробности ошибки не должны попадать в ответ
