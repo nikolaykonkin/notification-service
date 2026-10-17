@@ -51,3 +51,8 @@ docker-up:
 .PHONY: docker-down
 docker-down:
 	docker compose down
+
+# Открыть Prometheus в браузере (macOS: open, Linux: xdg-open)
+.PHONY: metrics
+metrics:
+	@open http://localhost:9090 2>/dev/null || xdg-open http://localhost:9090

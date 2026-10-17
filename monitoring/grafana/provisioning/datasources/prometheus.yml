@@ -1,0 +1,11 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # uid используется в дашборде для ссылки на этот источник данных
+    uid: prometheus
+    # access: proxy значит, что запросы к Prometheus идут через сервер Grafana, а не из браузера
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true

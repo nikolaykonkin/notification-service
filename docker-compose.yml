@@ -116,5 +116,34 @@ services:
     # Если процесс завершился с ошибкой (например, упал consumer), Docker поднимет его заново
     restart: unless-stopped
 
+  # Prometheus: забирает метрики сервиса и хранит их во времени
+  prometheus:
+    image: prom/prometheus:v3.5.5
+    ports:
+      - "127.0.0.1:9090:9090" # только с твоей машины
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    depends_on:
+      - notification-service
+
+  # Grafana: графики по данным из Prometheus
+  # Источник данных подключается через provisioning
+  grafana:
+    image: grafana/grafana:12.0.0
+    environment:
+      # Только для локального стенда. Порт открыт лишь на 127.0.0.1
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:

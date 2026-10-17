@@ -1,0 +1,10 @@
+global:
+  # Как часто Prometheus забирает метрики
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: notification-service
+    static_configs:
+      # Имя сервиса в сети compose и порт HTTP-сервера
+      # Путь /metrics используется по умолчанию
+      - targets: ["notification-service:8080"]
