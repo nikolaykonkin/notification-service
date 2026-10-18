@@ -20,11 +20,12 @@
 - Метрики Prometheus (`internal/metrics`): отдельный реестр, счетчики `notifications_sent_total` и `notifications_failed_total`, гистограмма `notification_duration_seconds` (метка `type`: `email`, `push` или `unknown`), стандартные метрики Go и процесса.
 - HTTP-сервер (`internal/httpserver`): `GET /metrics` для Prometheus и `GET /health`, который проверяет PostgreSQL и Redis (общий таймаут 2 секунды) и отвечает 200 или 503 без раскрытия текста ошибок. Заданы таймауты чтения и записи.
 - Сборка и запуск (`cmd/notification-service`): зависимости собираются через конструкторы, при старте проверяются PostgreSQL, Redis и Kafka (таймаут 15 секунд). Graceful shutdown по SIGINT и SIGTERM: сначала останавливаются HTTP-сервер (до 2 секунд) и gRPC-сервер (до 5 секунд), затем consumer, producer, Redis и PostgreSQL. Если consumer или один из серверов падают сами, процесс завершается с кодом 1.
-- Docker-образ сервиса (`Dockerfile`): многоступенчатая сборка, статический бинарник (`CGO_ENABLED=0`), запуск от непривилегированного пользователя, `.dockerignore` не пускает `.env` в образ.
+- Docker-образ сервиса (`Dockerfile`): многоступенчатая сборка, статический бинарник (`CGO_ENABLED=0`), запуск от непривилегированного пользователя, `.dockerignore` не пускает `.env` в образ, кеш сборки Go между сборками.
 - Docker Compose: PostgreSQL 17, Redis 7, Kafka 3.9 в режиме KRaft, одноразовый контейнер `kafka-init` (создает топики `notifications.email` и `notifications.push`), сам сервис (healthcheck через `/health`, перезапуск при падении), Prometheus и Grafana. Источник данных и дашборд Grafana подключаются из файлов (provisioning).
-- CI на GitHub Actions: `go vet`, `go test -race`, `go build`.
+- Интеграционные тесты (`internal/integration`): в одном процессе собираются настоящие компоненты (gRPC-сервер через bufconn, PostgreSQL, Redis, Kafka producer и consumer, процессор, метрики) и проверяются сквозные сценарии: уведомление принято как `pending`, обработано асинхронно, устаревший статус из кеша сброшен; сбой отправки (`failed` с причиной); превышение лимита.
+- CI на GitHub Actions: job `test` (`go vet`, `go test -race`, `go build`) и job `integration` (все тесты с настоящими PostgreSQL, Redis и Kafka из Docker Compose).
 
-Что это значит на практике: весь стенд поднимается одной командой `make docker-up`. gRPC доступен на `localhost:50051`, `/health` и `/metrics` на `localhost:8080`, Prometheus на `localhost:9090`, Grafana на `localhost:3000` (admin/admin, только локально) с готовым дашбордом. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем. Образ сервиса пока не публикуется в реестр. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
+Что это значит на практике: весь стенд поднимается одной командой `make docker-up`. gRPC доступен на `localhost:50051`, `/health` и `/metrics` на `localhost:8080`, Prometheus на `localhost:9090`, Grafana на `localhost:3000` (admin/admin, только локально) с готовым дашбордом. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем (путь `failed` проверяется интеграционным тестом с управляемой заглушкой). Образ сервиса пока не публикуется в реестр. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
 
 ## Архитектура
 
@@ -73,6 +74,23 @@ Prometheus раз в 15 секунд забирает `/metrics` сервиса,
 - Квантили на дашборде оценочные: Prometheus хранит счетчики корзин гистограммы и предполагает равномерное распределение внутри корзины. Эмуляция отправки занимает около 0,5 с и попадает в корзину от 0,5 до 1 с, поэтому p50 на графике около 0,75 с. Для точных значений нужны корзины, подобранные под реальное время обработки.
 - Логин и пароль Grafana (`admin` / `admin`) заданы только для локального стенда, порты Prometheus и Grafana открыты лишь на `127.0.0.1`.
 
+## Тесты
+
+Уровни:
+
+- unit: логика с заглушками (`api`, `processor`, `metrics`, `httpserver`), выполняются за секунды без внешних сервисов;
+- integration: настоящие PostgreSQL, Redis и Kafka (`storage`, `cache`, `ratelimit`, `kafka` и сквозные сценарии в `internal/integration`);
+- e2e (запущенный контейнер, вызов по сети) не автоматизирован, это ручной smoke-тест через grpcurl.
+
+Особенности интеграционных тестов:
+
+- Тесты, которым нужны внешние сервисы, пропускаются без переменных `TEST_DATABASE_URL`, `TEST_REDIS_URL` и `TEST_KAFKA_BROKERS`, поэтому обычный `go test` работает везде. `make test-integration` поднимает инфраструктуру, создает топики и запускает все тесты; в CI выполняется отдельный job.
+- Отправка заменена управляемой заглушкой (`Sender` это интерфейс): она может задержать обработку выбранного пользователя, поэтому состояние `pending` и сброс кеша проверяются детерминированно, и может вернуть ошибку для проверки `failed`.
+- Результат асинхронной обработки ждут опросом с таймаутом, а не `sleep`. Ожидание статуса опрашивает PostgreSQL напрямую: чтение через `GetNotification` могло бы само положить в кеш устаревший `pending` во время обработки (известная узкая гонка cache-aside), и тест стал бы нестабильным.
+- Топики Kafka общие, поэтому у каждого теста свой `user_id`, а consumer group в интеграционных тестах фиксированная, чтобы после первого запуска не перечитывать накопленные сообщения.
+- На время тестов контейнер сервиса останавливается: он читает те же топики и перезаписывал бы статусы. После тестов его можно вернуть командой `docker compose start notification-service`.
+- Результаты тестов с внешним состоянием не кешируются (`-count=1`).
+
 ## Стек
 
 Используется сейчас:
@@ -98,6 +116,7 @@ Prometheus раз в 15 секунд забирает `/metrics` сервиса,
 │   ├── cache/                  кеш уведомлений в Redis (готово)
 │   ├── config/                 конфигурация из env (готово)
 │   ├── httpserver/             HTTP: /metrics и /health (готово)
+│   ├── integration/            интеграционные тесты с настоящими сервисами (готово)
 │   ├── kafka/                  producer, consumer, проверка доступности (готово)
 │   ├── metrics/                метрики Prometheus (готово)
 │   ├── processor/              обработка события: отправка, статус, сброс кеша (готово)
@@ -174,16 +193,13 @@ make vet
 make test
 ```
 
-Тесты PostgreSQL, Redis и Kafka без соответствующих переменных окружения пропускаются (`SKIP`). Чтобы выполнить их с настоящими сервисами:
+Без переменных окружения тесты PostgreSQL, Redis, Kafka и интеграционные пропускаются (`SKIP`). Чтобы выполнить все тесты с настоящими сервисами, одной командой:
 
 ```bash
-TEST_DATABASE_URL="postgres://notification:notification@localhost:5432/notification?sslmode=disable" \
-TEST_REDIS_URL="redis://localhost:6379/0" \
-TEST_KAFKA_BROKERS="localhost:9092" \
-make test-race
+make test-integration
 ```
 
-Тесты Kafka идут заметно дольше остальных: consumer ждет вступления в группу. Топики общие, поэтому каждый тест ищет в них сообщения со своим уникальным id.
+Она поднимает PostgreSQL, Redis и Kafka из Docker Compose, создает топики, останавливает контейнер сервиса (он читает те же топики и мешал бы тестам) и запускает `go test -race -count=1 ./...`. Первый запуск дольше остальных: consumer ждет вступления в группу и обрабатывает накопленные сообщения. Вернуть сервис после тестов: `docker compose start notification-service`.
 
 Остановить стенд:
 
@@ -193,11 +209,13 @@ make docker-down
 
 ## CI
 
-Workflow `.github/workflows/ci.yml` запускается на push в `main` и на pull request: `go vet`, `go test -race`, `go build`. Тесты PostgreSQL, Redis и Kafka в CI пока пропускаются, потому что сервисы в workflow не подняты. Интеграционные тесты с реальными PostgreSQL, Redis и Kafka появятся в CI позже (см. Roadmap).
+Workflow `.github/workflows/ci.yml` запускается на push в `main` и на pull request и состоит из двух job, которые идут параллельно:
+
+- `test`: `go vet`, `go test -race`, `go build`. Тесты, которым нужны внешние сервисы, здесь пропускаются, зато результат приходит быстро.
+- `integration`: `make test-integration`, то есть PostgreSQL, Redis и Kafka из `docker-compose.yml` и все тесты, включая интеграционные. При падении в лог выводятся логи контейнеров.
 
 ## Roadmap
 
-- Интеграционные тесты
 - CD: сборка Docker-образа в CI и публикация в ghcr.io
 - Полная версия README
 - Финальная проверка: `make vet`, `make test-race`, `docker compose up`, smoke-тест через grpcurl
