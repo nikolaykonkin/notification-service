@@ -4,14 +4,20 @@ FROM golang:1.26-alpine AS builder
 WORKDIR /src
 
 # Сначала только файлы зависимостей: этот слой пересобирается, только когда они меняются
+# Кеш модулей (/go/pkg/mod) хранится вне образа и переживает пересборки
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
 
 # CGO_ENABLED=0 дает статический бинарник без зависимости от системной libc
 # -trimpath убирает локальные пути, -s -w вырезает отладочную информацию (меньше размер)
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+# Кеш сборки Go (/root/.cache/go-build) тоже хранится вне образа: после правки одного файла
+# компилируются только измененные пакеты, а не вся программа с зависимостями
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/notification-service ./cmd/notification-service
 
 # Этап 2. Итоговый образ: только Alpine и готовый бинарник
