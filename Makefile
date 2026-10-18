@@ -41,7 +41,7 @@ test-race:
 vet:
 	go vet ./...
 
-# Поднять инфраструктуру и сервис в фоне (образ сервиса пересобирается)
+# Поднять весь стенд: инфраструктуру, сервис, Prometheus и Grafana (образ сервиса пересобирается)
 .PHONY: docker-up
 docker-up:
 	docker compose up -d --build

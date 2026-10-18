@@ -1,0 +1,266 @@
+{
+    "uid": "notification-service",
+    "title": "notification-service",
+    "tags": [
+        "notification-service"
+    ],
+    "timezone": "browser",
+    "schemaVersion": 39,
+    "version": 1,
+    "refresh": "10s",
+    "time": {
+        "from": "now-30m",
+        "to": "now"
+    },
+    "panels": [
+        {
+            "id": 1,
+            "type": "stat",
+            "title": "Сервис",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 6,
+                "x": 0,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "up{job=\"notification-service\"}"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "mappings": [
+                        {
+                            "type": "value",
+                            "options": {
+                                "0": {
+                                    "text": "DOWN",
+                                    "color": "red",
+                                    "index": 0
+                                },
+                                "1": {
+                                    "text": "UP",
+                                    "color": "green",
+                                    "index": 1
+                                }
+                            }
+                        }
+                    ],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "red",
+                                "value": null
+                            },
+                            {
+                                "color": "green",
+                                "value": 1
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "colorMode": "background",
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                }
+            }
+        },
+        {
+            "id": 2,
+            "type": "stat",
+            "title": "Отправлено (всего)",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 9,
+                "x": 6,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "sum(notifications_sent_total)"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {},
+                "overrides": []
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                }
+            }
+        },
+        {
+            "id": 3,
+            "type": "stat",
+            "title": "Ошибок отправки (всего)",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+            },
+            "gridPos": {
+                "h": 4,
+                "w": 9,
+                "x": 15,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "sum(notifications_failed_total)"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {},
+                "overrides": []
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                }
+            }
+        },
+        {
+            "id": 4,
+            "type": "timeseries",
+            "title": "Уведомлений в секунду",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 4
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "sum by (type) (rate(notifications_sent_total[1m]))",
+                    "legendFormat": "sent {{type}}"
+                },
+                {
+                    "refId": "B",
+                    "expr": "sum by (type) (rate(notifications_failed_total[1m]))",
+                    "legendFormat": "failed {{type}}"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "ops"
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom"
+                }
+            }
+        },
+        {
+            "id": 5,
+            "type": "timeseries",
+            "title": "Время обработки",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 4
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "histogram_quantile(0.5, sum by (le) (rate(notification_duration_seconds_bucket[5m])))",
+                    "legendFormat": "p50"
+                },
+                {
+                    "refId": "B",
+                    "expr": "histogram_quantile(0.95, sum by (le) (rate(notification_duration_seconds_bucket[5m])))",
+                    "legendFormat": "p95"
+                },
+                {
+                    "refId": "C",
+                    "expr": "sum(rate(notification_duration_seconds_sum[5m])) / sum(rate(notification_duration_seconds_count[5m]))",
+                    "legendFormat": "среднее"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom"
+                }
+            }
+        },
+        {
+            "id": 6,
+            "type": "timeseries",
+            "title": "Горутины",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "prometheus"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 12
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "go_goroutines{job=\"notification-service\"}",
+                    "legendFormat": "goroutines"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {},
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom"
+                }
+            }
+        }
+    ]
+}

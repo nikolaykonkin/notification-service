@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: notification-service
+    type: file
+    # Дашборд из файла нельзя изменить из интерфейса: правится JSON и перезапускается Grafana
+    allowUiUpdates: false
+    disableDeletion: true
+    options:
+      # Папка внутри контейнера, куда compose монтирует наши дашборды
+      path: /etc/grafana/dashboards

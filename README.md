@@ -20,10 +20,11 @@
 - Метрики Prometheus (`internal/metrics`): отдельный реестр, счетчики `notifications_sent_total` и `notifications_failed_total`, гистограмма `notification_duration_seconds` (метка `type`: `email`, `push` или `unknown`), стандартные метрики Go и процесса.
 - HTTP-сервер (`internal/httpserver`): `GET /metrics` для Prometheus и `GET /health`, который проверяет PostgreSQL и Redis (общий таймаут 2 секунды) и отвечает 200 или 503 без раскрытия текста ошибок. Заданы таймауты чтения и записи.
 - Сборка и запуск (`cmd/notification-service`): зависимости собираются через конструкторы, при старте проверяются PostgreSQL, Redis и Kafka (таймаут 15 секунд). Graceful shutdown по SIGINT и SIGTERM: сначала останавливаются HTTP-сервер (до 2 секунд) и gRPC-сервер (до 5 секунд), затем consumer, producer, Redis и PostgreSQL. Если consumer или один из серверов падают сами, процесс завершается с кодом 1.
-- Docker Compose с PostgreSQL 17, Redis 7 и Kafka 3.9 в режиме KRaft. Одноразовый контейнер `kafka-init` создает топики `notifications.email` и `notifications.push`.
+- Docker-образ сервиса (`Dockerfile`): многоступенчатая сборка, статический бинарник (`CGO_ENABLED=0`), запуск от непривилегированного пользователя, `.dockerignore` не пускает `.env` в образ.
+- Docker Compose: PostgreSQL 17, Redis 7, Kafka 3.9 в режиме KRaft, одноразовый контейнер `kafka-init` (создает топики `notifications.email` и `notifications.push`), сам сервис (healthcheck через `/health`, перезапуск при падении), Prometheus и Grafana. Источник данных и дашборд Grafana подключаются из файлов (provisioning).
 - CI на GitHub Actions: `go vet`, `go test -race`, `go build`.
 
-Что это значит на практике: сервис запускается командой `make run` вместе с локальной инфраструктурой, принимает gRPC-вызовы на порту `GRPC_PORT` и отдает `/metrics` и `/health` на порту `HTTP_PORT`. Prometheus и Grafana в Docker Compose пока не подняты, метрики можно посмотреть через `curl`. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем. Docker-образа сервиса нет. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
+Что это значит на практике: весь стенд поднимается одной командой `make docker-up`. gRPC доступен на `localhost:50051`, `/health` и `/metrics` на `localhost:8080`, Prometheus на `localhost:9090`, Grafana на `localhost:3000` (admin/admin, только локально) с готовым дашбордом. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем. Образ сервиса пока не публикуется в реестр. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
 
 ## Архитектура
 
@@ -59,6 +60,19 @@
                                                            PostgreSQL
 ```
 
+## Мониторинг
+
+Prometheus раз в 15 секунд забирает `/metrics` сервиса, Grafana рисует графики. Источник данных и дашборд `notification-service` описаны файлами в `monitoring/` и подключаются при старте Grafana (provisioning), поэтому после `make docker-up` дашборд появляется сам.
+
+Решения и особенности:
+
+- Дашборд хранится как JSON в git. Он воспроизводим (не пропадает вместе с томом Grafana), его изменения видны в diff и откатываются. Минус: JSON многословный, запросы лежат внутри строк с экранированием, diff после экспорта получается шумным. Для большого числа дашбордов обычно переходят на генерацию (например, grafonnet), для одного дашборда это избыточно.
+- Интерфейс Grafana для этого дашборда работает только на чтение (`allowUiUpdates: false`), иначе правка мышкой расходилась бы с файлом и терялась при следующем запуске. Рабочий цикл: изменить панель в интерфейсе без сохранения, выгрузить через Export as JSON, заменить файл `monitoring/grafana/dashboards/notification-service.json` и закоммитить.
+- Связи по идентификаторам: `uid` источника данных в `datasources/prometheus.yml` должен совпадать со ссылками в панелях, а смена `uid` дашборда создаст новый дашборд вместо обновления старого. Числовой `id` в файле не указывается: он локален для базы Grafana.
+- Метка `type` у метрик принимает только `email`, `push` и `unknown`: тип приходит из Kafka, и без ограничения мусорные значения создавали бы неограниченное число временных рядов (проблема кардинальности).
+- Квантили на дашборде оценочные: Prometheus хранит счетчики корзин гистограммы и предполагает равномерное распределение внутри корзины. Эмуляция отправки занимает около 0,5 с и попадает в корзину от 0,5 до 1 с, поэтому p50 на графике около 0,75 с. Для точных значений нужны корзины, подобранные под реальное время обработки.
+- Логин и пароль Grafana (`admin` / `admin`) заданы только для локального стенда, порты Prometheus и Grafana открыты лишь на `127.0.0.1`.
+
 ## Стек
 
 Используется сейчас:
@@ -68,11 +82,11 @@
 - PostgreSQL 17, драйвер pgx
 - Redis 7, клиент go-redis
 - Kafka 3.9 (KRaft, без ZooKeeper), клиент kafka-go
-- Prometheus client_golang (метрики)
+- Prometheus (client_golang в сервисе, сервер в Docker Compose), Grafana
 - Docker, Docker Compose
 - GitHub Actions
 
-Планируется: Prometheus (сервер), Grafana, Dockerfile сервиса, публикация образа в ghcr.io.
+Планируется: публикация образа в ghcr.io.
 
 ## Структура проекта
 
@@ -90,38 +104,43 @@
 │   ├── ratelimit/              rate limiting на Redis (готово)
 │   └── storage/                репозиторий PostgreSQL (готово)
 ├── migrations/                 001_init.sql
+├── monitoring/
+│   ├── prometheus/             конфигурация Prometheus
+│   └── grafana/                provisioning и дашборд Grafana
 ├── proto/notification/v1/      контракт и сгенерированный код
 ├── .github/workflows/ci.yml    CI
-├── docker-compose.yml          PostgreSQL, Redis, Kafka
+├── Dockerfile                  сборка образа сервиса
+├── .dockerignore
+├── docker-compose.yml          весь стенд
 ├── Makefile
-└── .env.example
+└── .env.example                настройки для запуска из консоли (make run)
 ```
 
-Появится позже: `Dockerfile`, конфигурация Prometheus и дашборд Grafana в Docker Compose, workflow публикации образа.
+Появится позже: workflow публикации образа.
 
 ## Быстрый старт
 
 Нужны Go 1.26, Docker и make. Сгенерированный protobuf-код лежит в репозитории, поэтому `protoc` нужен только для `make proto`.
 
-Поднять инфраструктуру:
+Поднять весь стенд (при первом запуске собирается образ сервиса, это занимает пару минут):
 
 ```bash
-cp .env.example .env
 make docker-up
 docker compose ps -a
 ```
 
-Через 30-60 секунд `postgres`, `redis` и `kafka` должны быть в статусе `healthy`, а `kafka-init` в статусе `Exited (0)`: он создал топики и завершился.
+Через 30-60 секунд `postgres`, `redis`, `kafka` и `notification-service` должны быть в статусе `healthy`, а `kafka-init` в статусе `Exited (0)`: он создал топики и завершился.
+
+Адреса:
+
+- gRPC: `localhost:50051`
+- `/health` и `/metrics`: `localhost:8080`
+- Prometheus: `localhost:9090` (`make metrics` открывает его в браузере)
+- Grafana: `localhost:3000`, логин и пароль `admin` / `admin` (только для локального стенда), дашборд `notification-service`
 
 Миграция из `migrations/` выполняется автоматически, но только при первом запуске на пустой базе. Чтобы применить ее заново, пересоздайте том: `docker compose down -v`, затем `make docker-up`.
 
-Запустить сервис (останавливается по Ctrl+C):
-
-```bash
-make run
-```
-
-Вызвать сервис через [grpcurl](https://github.com/fullstorydev/grpcurl) (в другом терминале):
+Вызвать сервис через [grpcurl](https://github.com/fullstorydev/grpcurl):
 
 ```bash
 grpcurl -plaintext localhost:50051 list
@@ -140,7 +159,13 @@ curl -s localhost:8080/health
 curl -s localhost:8080/metrics | grep notification
 ```
 
-`/health` отвечает 200 и `{"status":"ok",...}`, если PostgreSQL и Redis отвечают, иначе 503.
+Запустить сервис из консоли вместо контейнера (например, для отладки). Порты 50051 и 8080 заняты контейнером, поэтому его нужно остановить:
+
+```bash
+cp .env.example .env
+docker compose stop notification-service
+make run
+```
 
 Запустить тесты:
 
@@ -160,7 +185,7 @@ make test-race
 
 Тесты Kafka идут заметно дольше остальных: consumer ждет вступления в группу. Топики общие, поэтому каждый тест ищет в них сообщения со своим уникальным id.
 
-Остановить инфраструктуру:
+Остановить стенд:
 
 ```bash
 make docker-down
@@ -172,7 +197,6 @@ Workflow `.github/workflows/ci.yml` запускается на push в `main` �
 
 ## Roadmap
 
-- Dockerfile сервиса, Prometheus и Grafana в Docker Compose
 - Интеграционные тесты
 - CD: сборка Docker-образа в CI и публикация в ghcr.io
 - Полная версия README
