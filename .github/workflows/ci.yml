@@ -56,3 +56,36 @@ jobs:
       - name: Container logs
         if: failure()
         run: docker compose logs --no-color --tail=200
+
+  # Сборка Docker-образа: проверяем, что Dockerfile рабочий и контейнер не запускается от root
+  # Образ здесь только собирается и не публикуется: публикацию выполняет cd.yml
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Настраивает Buildx: без него Docker не может сохранять кеш слоев между запусками в хранилище GitHub Actions (type=gha)
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          # Копируем образ в Docker раннера: иначе docker run в шаге ниже его не увидит
+          load: true
+          tags: notification-service:ci
+          # Аттестации сборки здесь не нужны и несовместимы с load
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Регрессионная проверка: пользователь внутри образа не root (его uid не равен 0)
+      - name: Check that the container does not run as root
+        run: |
+          uid="$(docker run --rm --entrypoint id notification-service:ci -u)"
+          echo "uid=${uid}"
+          test "${uid}" != "0"
