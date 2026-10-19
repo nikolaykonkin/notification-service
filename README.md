@@ -23,9 +23,10 @@
 - Docker-образ сервиса (`Dockerfile`): многоступенчатая сборка, статический бинарник (`CGO_ENABLED=0`), запуск от непривилегированного пользователя, `.dockerignore` не пускает `.env` в образ, кеш сборки Go между сборками.
 - Docker Compose: PostgreSQL 17, Redis 7, Kafka 3.9 в режиме KRaft, одноразовый контейнер `kafka-init` (создает топики `notifications.email` и `notifications.push`), сам сервис (healthcheck через `/health`, перезапуск при падении), Prometheus и Grafana. Источник данных и дашборд Grafana подключаются из файлов (provisioning).
 - Интеграционные тесты (`internal/integration`): в одном процессе собираются настоящие компоненты (gRPC-сервер через bufconn, PostgreSQL, Redis, Kafka producer и consumer, процессор, метрики) и проверяются сквозные сценарии: уведомление принято как `pending`, обработано асинхронно, устаревший статус из кеша сброшен; сбой отправки (`failed` с причиной); превышение лимита.
-- CI на GitHub Actions: job `test` (`go vet`, `go test -race`, `go build`) и job `integration` (все тесты с настоящими PostgreSQL, Redis и Kafka из Docker Compose).
+- CI на GitHub Actions: job `test` (`go vet`, `go test -race`, `go build`), job `integration` (все тесты с настоящими PostgreSQL, Redis и Kafka из Docker Compose) и job `docker` (сборка образа и проверка, что контейнер не запускается от root).
+- CD на GitHub Actions: после успешного CI на `main` образ публикуется в `ghcr.io/nikolaykonkin/notification-service` с тегами `latest` и `sha-<7 символов коммита>`.
 
-Что это значит на практике: весь стенд поднимается одной командой `make docker-up`. gRPC доступен на `localhost:50051`, `/health` и `/metrics` на `localhost:8080`, Prometheus на `localhost:9090`, Grafana на `localhost:3000` (admin/admin, только локально) с готовым дашбордом. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем (путь `failed` проверяется интеграционным тестом с управляемой заглушкой). Образ сервиса пока не публикуется в реестр. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
+Что это значит на практике: весь стенд поднимается одной командой `make docker-up`. gRPC доступен на `localhost:50051`, `/health` и `/metrics` на `localhost:8080`, Prometheus на `localhost:9090`, Grafana на `localhost:3000` (admin/admin, только локально) с готовым дашбордом. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем (путь `failed` проверяется интеграционным тестом с управляемой заглушкой). Образ публикуется только для `linux/amd64`. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
 
 ## Архитектура
 
@@ -91,6 +92,28 @@ Prometheus раз в 15 секунд забирает `/metrics` сервиса,
 - На время тестов контейнер сервиса останавливается: он читает те же топики и перезаписывал бы статусы. После тестов его можно вернуть командой `docker compose start notification-service`.
 - Результаты тестов с внешним состоянием не кешируются (`-count=1`).
 
+## CI/CD
+
+CI (`.github/workflows/ci.yml`) запускается на push в `main` и на pull request, три job идут параллельно:
+
+- `test`: `go vet`, `go test -race`, `go build`. Тесты, которым нужны внешние сервисы, здесь пропускаются, зато результат приходит быстро.
+- `integration`: `make test-integration`, то есть PostgreSQL, Redis и Kafka из `docker-compose.yml` и все тесты, включая интеграционные. При падении в лог выводятся логи контейнеров.
+- `docker`: сборка образа и проверка, что контейнер не запускается от root. Кеш слоев хранится в GitHub Actions.
+
+CD (`.github/workflows/cd.yml`) публикует образ в `ghcr.io/nikolaykonkin/notification-service`:
+
+```bash
+docker pull ghcr.io/nikolaykonkin/notification-service:latest
+```
+
+Решения и особенности:
+
+- CI не имеет побочных эффектов и прав на запись, поэтому запускается для любого pull request. CD вынесен в отдельный workflow и запускается через `workflow_run` только после успешного CI на push в `main`, чтобы образ не уходил в реестр с непроверенного коммита и из pull request.
+- Для входа в реестр используется временный `GITHUB_TOKEN`. Право `packages: write` выдано только job-у публикации, у всего workflow права только на чтение.
+- Теги: `latest` (подвижный, перезаписывается) и `sha-<7 символов коммита>` (не перезаписывается, однозначно указывает на коммит). Образ связан с репозиторием меткой `org.opencontainers.image.source`, коммит записан в `org.opencontainers.image.revision`.
+- В контексте `workflow_run` переменная `GITHUB_SHA` указывает на последний коммит `main`, а не на проверенный CI, поэтому CD берет `head_sha` из события и собирает именно проверенный коммит. Блок `concurrency` выстраивает публикации в очередь, чтобы старая сборка не перезаписала `latest`.
+- Ограничения: образ публикуется только для `linux/amd64`; CD пересобирает образ из проверенного коммита (слои берутся из кеша), а не публикует тот же артефакт, который собрал CI; кеши `--mount=type=cache` Dockerfile (модули и сборка Go) в кеш слоев GitHub Actions не попадают, поэтому после изменения кода шаг `go build` в CI выполняется с нуля; образ не подписан и не сканируется на уязвимости.
+
 ## Стек
 
 Используется сейчас:
@@ -101,10 +124,8 @@ Prometheus раз в 15 секунд забирает `/metrics` сервиса,
 - Redis 7, клиент go-redis
 - Kafka 3.9 (KRaft, без ZooKeeper), клиент kafka-go
 - Prometheus (client_golang в сервисе, сервер в Docker Compose), Grafana
-- Docker, Docker Compose
+- Docker, Docker Compose, GitHub Container Registry (ghcr.io)
 - GitHub Actions
-
-Планируется: публикация образа в ghcr.io.
 
 ## Структура проекта
 
@@ -127,15 +148,15 @@ Prometheus раз в 15 секунд забирает `/metrics` сервиса,
 │   ├── prometheus/             конфигурация Prometheus
 │   └── grafana/                provisioning и дашборд Grafana
 ├── proto/notification/v1/      контракт и сгенерированный код
-├── .github/workflows/ci.yml    CI
+├── .github/workflows/
+│   ├── ci.yml                  проверки: vet, тесты, интеграционные тесты, образ
+│   └── cd.yml                  публикация образа в ghcr.io
 ├── Dockerfile                  сборка образа сервиса
 ├── .dockerignore
 ├── docker-compose.yml          весь стенд
 ├── Makefile
 └── .env.example                настройки для запуска из консоли (make run)
 ```
-
-Появится позже: workflow публикации образа.
 
 ## Быстрый старт
 
@@ -207,15 +228,7 @@ make test-integration
 make docker-down
 ```
 
-## CI
-
-Workflow `.github/workflows/ci.yml` запускается на push в `main` и на pull request и состоит из двух job, которые идут параллельно:
-
-- `test`: `go vet`, `go test -race`, `go build`. Тесты, которым нужны внешние сервисы, здесь пропускаются, зато результат приходит быстро.
-- `integration`: `make test-integration`, то есть PostgreSQL, Redis и Kafka из `docker-compose.yml` и все тесты, включая интеграционные. При падении в лог выводятся логи контейнеров.
-
 ## Roadmap
 
-- CD: сборка Docker-образа в CI и публикация в ghcr.io
 - Полная версия README
 - Финальная проверка: `make vet`, `make test-race`, `docker compose up`, smoke-тест через grpcurl
