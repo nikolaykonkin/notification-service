@@ -2,165 +2,65 @@
 
 [![CI](https://github.com/nikolaykonkin/notification-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nikolaykonkin/notification-service/actions/workflows/ci.yml)
 
-Сервис уведомлений на Go (в разработке). Целевая архитектура: принимает события по gRPC, публикует их в Kafka, обрабатывает асинхронно, кеширует статусы в Redis и хранит историю в PostgreSQL. Ограничивает число уведомлений на пользователя (rate limiting). Пет-проект: делаю для себя, чтобы на практике разобраться с gRPC, Kafka и Redis.
+Сервис уведомлений на Go: принимает события по gRPC, публикует их в Kafka, обрабатывает асинхронно, кеширует статусы в Redis и хранит историю в PostgreSQL. Ограничивает число уведомлений на пользователя. Пет-проект: сделан, чтобы на практике разобрать gRPC, Kafka, Redis, PostgreSQL, метрики и CI/CD. Отправка эмулируется (реального провайдера email или push нет), остальная инфраструктура (Kafka, Redis, PostgreSQL, метрики, CI/CD) настоящая, весь стенд поднимается одной командой.
 
-## Статус
+## Содержание
 
-На текущий момент готово:
+- [Что демонстрирует проект](#что-демонстрирует-проект)
+- [Стек](#стек)
+- [Быстрый старт](#быстрый-старт)
+- [Примеры вызовов](#примеры-вызовов)
+- [Схема](#схема)
+- [Как устроено](#как-устроено)
+  - [Контракт](#контракт)
+  - [Прием: SendNotification](#прием-sendnotification)
+  - [Ограничение частоты](#ограничение-частоты)
+  - [Kafka: producer и consumer](#kafka-producer-и-consumer)
+  - [Обработка событий](#обработка-событий)
+  - [Выдача: GetNotification и кеш](#выдача-getnotification-и-кеш)
+  - [PostgreSQL](#postgresql)
+  - [HTTP: /metrics и /health](#http-metrics-и-health)
+  - [Запуск и graceful shutdown](#запуск-и-graceful-shutdown)
+  - [Конфигурация](#конфигурация)
+- [Тесты](#тесты)
+- [Мониторинг](#мониторинг)
+- [CI/CD](#cicd)
+- [Структура проекта](#структура-проекта)
+- [Что не реализовано и почему](#что-не-реализовано-и-почему)
+  - [Доставка и обработка событий](#доставка-и-обработка-событий)
+  - [Кеш и ограничение частоты](#кеш-и-ограничение-частоты)
+  - [API и безопасность](#api-и-безопасность)
+  - [Данные и миграции](#данные-и-миграции)
+  - [Наблюдаемость](#наблюдаемость)
+  - [CI/CD и образ](#cicd-и-образ)
+  - [Осознанные границы проекта](#осознанные-границы-проекта)
 
-- gRPC-контракт `NotificationService` с унарными методами `SendNotification` и `GetNotification`, кодогенерация через `make proto`.
-- Конфигурация из переменных окружения. Все ошибки собираются через `errors.Join`, сервис не стартует, если обязательная переменная не задана или некорректна.
-- PostgreSQL: миграция `migrations/001_init.sql` (UUID, JSONB, CHECK на `type` и `status`, индексы) и репозиторий `internal/storage` с методами `Create`, `GetByID`, `UpdateStatus`.
-- Redis: кеш уведомлений по id с TTL (`internal/cache`) и rate limiting по `user_id` (`internal/ratelimit`, fixed window на `INCR` + `EXPIRE NX` в одной транзакции).
-- Kafka producer (`internal/kafka`): публикует событие в топик `notifications.email` или `notifications.push` по типу уведомления. Ключ сообщения `user_id`, поэтому события одного пользователя идут в одну партицию и сохраняют порядок. Запись синхронная, подтверждается всеми репликами.
-- Kafka consumer (`internal/kafka`): читает оба топика в составе consumer group. Гарантия доставки at-least-once: offset фиксируется после обработки, поэтому при сбое событие может прийти повторно. Некорректные сообщения логируются и пропускаются. Если обработчик вернул ошибку, consumer останавливается без фиксации offset.
-- Проверка доступности Kafka на старте (`kafka.Ping`): TCP-подключение хотя бы к одному брокеру.
-- Обработка события (`internal/processor`): эмуляция отправки (пауза), запись статуса `sent` или `failed` в PostgreSQL и удаление записи из кеша. Ошибка отправки сохраняется как статус `failed`, сбой кеша только логируется. Результат передается в метрики через интерфейс `Recorder`.
-- gRPC-сервер (`internal/api`): `SendNotification` проверяет запрос и лимит (при сбое Redis пропускает запрос), сохраняет уведомление со статусом `pending` в PostgreSQL и публикует событие в Kafka; если публикация не удалась, запись помечается `failed`. `GetNotification` читает из кеша, а при промахе или сбое кеша из PostgreSQL. Внутренние ошибки клиенту не раскрываются. Покрыт тестами через bufconn.
-- Метрики Prometheus (`internal/metrics`): отдельный реестр, счетчики `notifications_sent_total` и `notifications_failed_total`, гистограмма `notification_duration_seconds` (метка `type`: `email`, `push` или `unknown`), стандартные метрики Go и процесса.
-- HTTP-сервер (`internal/httpserver`): `GET /metrics` для Prometheus и `GET /health`, который проверяет PostgreSQL и Redis (общий таймаут 2 секунды) и отвечает 200 или 503 без раскрытия текста ошибок. Заданы таймауты чтения и записи.
-- Сборка и запуск (`cmd/notification-service`): зависимости собираются через конструкторы, при старте проверяются PostgreSQL, Redis и Kafka (таймаут 15 секунд). Graceful shutdown по SIGINT и SIGTERM: сначала останавливаются HTTP-сервер (до 2 секунд) и gRPC-сервер (до 5 секунд), затем consumer, producer, Redis и PostgreSQL. Если consumer или один из серверов падают сами, процесс завершается с кодом 1.
-- Docker-образ сервиса (`Dockerfile`): многоступенчатая сборка, статический бинарник (`CGO_ENABLED=0`), запуск от непривилегированного пользователя, `.dockerignore` не пускает `.env` в образ, кеш сборки Go между сборками.
-- Docker Compose: PostgreSQL 17, Redis 7, Kafka 3.9 в режиме KRaft, одноразовый контейнер `kafka-init` (создает топики `notifications.email` и `notifications.push`), сам сервис (healthcheck через `/health`, перезапуск при падении), Prometheus и Grafana. Источник данных и дашборд Grafana подключаются из файлов (provisioning).
-- Интеграционные тесты (`internal/integration`): в одном процессе собираются настоящие компоненты (gRPC-сервер через bufconn, PostgreSQL, Redis, Kafka producer и consumer, процессор, метрики) и проверяются сквозные сценарии: уведомление принято как `pending`, обработано асинхронно, устаревший статус из кеша сброшен; сбой отправки (`failed` с причиной); превышение лимита.
-- CI на GitHub Actions: job `test` (`go vet`, `go test -race`, `go build`), job `integration` (все тесты с настоящими PostgreSQL, Redis и Kafka из Docker Compose) и job `docker` (сборка образа и проверка, что контейнер не запускается от root).
-- CD на GitHub Actions: после успешного CI на `main` образ публикуется в `ghcr.io/nikolaykonkin/notification-service` с тегами `latest` и `sha-<7 символов коммита>`.
+## Что демонстрирует проект
 
-Что это значит на практике: весь стенд поднимается одной командой `make docker-up`. gRPC доступен на `localhost:50051`, `/health` и `/metrics` на `localhost:8080`, Prometheus на `localhost:9090`, Grafana на `localhost:3000` (admin/admin, только локально) с готовым дашбордом. Эмуляция отправки не завершается ошибкой, поэтому `notifications_failed_total` в ручной проверке остается нулем (путь `failed` проверяется интеграционным тестом с управляемой заглушкой). Образ публикуется только для `linux/amd64`. Включен gRPC reflection для удобства `grpcurl`. Все остальное перечислено в разделе Roadmap.
-
-## Архитектура
-
-Сервис это один процесс: gRPC-сервер, HTTP-сервер (`/metrics`, `/health`), producer и consumer живут в нем вместе (пакеты `internal/api`, `internal/httpserver`, `internal/kafka`). Consumer только читает сообщения и передает их обработчику, а сама обработка вынесена в `internal/processor`. Kafka, Redis и PostgreSQL внешние системы, а Kafka здесь только транспорт между producer и consumer одного и того же сервиса.
-
-```
-Отправка:
-
-клиент
-  |
-  | gRPC SendNotification
-  v
-+------- notification-service (один процесс) --------+
-|                                                    |
-|  gRPC-сервер ---- проверка лимита -----------------|--> Redis
-|       |                                            |
-|       v                                            |
-|  producer -----------------------------------------|--> Kafka
-|                                                    |    notifications.email
-|                                                    |    notifications.push
-|  consumer <----------------------------------------|--- Kafka
-|       |                                            |
-|       +---- статус sent/failed --------------------|--> PostgreSQL
-|       +---- обновление кеша -----------------------|--> Redis
-|                                                    |
-+----------------------------------------------------+
-
-Чтение:
-
-  клиент --gRPC GetNotification--> notification-service --> Redis (кеш, TTL 5 минут)
-                                                                | промах
-                                                                v
-                                                           PostgreSQL
-```
-
-## Мониторинг
-
-Prometheus раз в 15 секунд забирает `/metrics` сервиса, Grafana рисует графики. Источник данных и дашборд `notification-service` описаны файлами в `monitoring/` и подключаются при старте Grafana (provisioning), поэтому после `make docker-up` дашборд появляется сам.
-
-Решения и особенности:
-
-- Дашборд хранится как JSON в git. Он воспроизводим (не пропадает вместе с томом Grafana), его изменения видны в diff и откатываются. Минус: JSON многословный, запросы лежат внутри строк с экранированием, diff после экспорта получается шумным. Для большого числа дашбордов обычно переходят на генерацию (например, grafonnet), для одного дашборда это избыточно.
-- Интерфейс Grafana для этого дашборда работает только на чтение (`allowUiUpdates: false`), иначе правка мышкой расходилась бы с файлом и терялась при следующем запуске. Рабочий цикл: изменить панель в интерфейсе без сохранения, выгрузить через Export as JSON, заменить файл `monitoring/grafana/dashboards/notification-service.json` и закоммитить.
-- Связи по идентификаторам: `uid` источника данных в `datasources/prometheus.yml` должен совпадать со ссылками в панелях, а смена `uid` дашборда создаст новый дашборд вместо обновления старого. Числовой `id` в файле не указывается: он локален для базы Grafana.
-- Метка `type` у метрик принимает только `email`, `push` и `unknown`: тип приходит из Kafka, и без ограничения мусорные значения создавали бы неограниченное число временных рядов (проблема кардинальности).
-- Квантили на дашборде оценочные: Prometheus хранит счетчики корзин гистограммы и предполагает равномерное распределение внутри корзины. Эмуляция отправки занимает около 0,5 с и попадает в корзину от 0,5 до 1 с, поэтому p50 на графике около 0,75 с. Для точных значений нужны корзины, подобранные под реальное время обработки.
-- Логин и пароль Grafana (`admin` / `admin`) заданы только для локального стенда, порты Prometheus и Grafana открыты лишь на `127.0.0.1`.
-
-## Тесты
-
-Уровни:
-
-- unit: логика с заглушками (`api`, `processor`, `metrics`, `httpserver`), выполняются за секунды без внешних сервисов;
-- integration: настоящие PostgreSQL, Redis и Kafka (`storage`, `cache`, `ratelimit`, `kafka` и сквозные сценарии в `internal/integration`);
-- e2e (запущенный контейнер, вызов по сети) не автоматизирован, это ручной smoke-тест через grpcurl.
-
-Особенности интеграционных тестов:
-
-- Тесты, которым нужны внешние сервисы, пропускаются без переменных `TEST_DATABASE_URL`, `TEST_REDIS_URL` и `TEST_KAFKA_BROKERS`, поэтому обычный `go test` работает везде. `make test-integration` поднимает инфраструктуру, создает топики и запускает все тесты; в CI выполняется отдельный job.
-- Отправка заменена управляемой заглушкой (`Sender` это интерфейс): она может задержать обработку выбранного пользователя, поэтому состояние `pending` и сброс кеша проверяются детерминированно, и может вернуть ошибку для проверки `failed`.
-- Результат асинхронной обработки ждут опросом с таймаутом, а не `sleep`. Ожидание статуса опрашивает PostgreSQL напрямую: чтение через `GetNotification` могло бы само положить в кеш устаревший `pending` во время обработки (известная узкая гонка cache-aside), и тест стал бы нестабильным.
-- Топики Kafka общие, поэтому у каждого теста свой `user_id`, а consumer group в интеграционных тестах фиксированная, чтобы после первого запуска не перечитывать накопленные сообщения.
-- На время тестов контейнер сервиса останавливается: он читает те же топики и перезаписывал бы статусы. После тестов его можно вернуть командой `docker compose start notification-service`.
-- Результаты тестов с внешним состоянием не кешируются (`-count=1`).
-
-## CI/CD
-
-CI (`.github/workflows/ci.yml`) запускается на push в `main` и на pull request, три job идут параллельно:
-
-- `test`: `go vet`, `go test -race`, `go build`. Тесты, которым нужны внешние сервисы, здесь пропускаются, зато результат приходит быстро.
-- `integration`: `make test-integration`, то есть PostgreSQL, Redis и Kafka из `docker-compose.yml` и все тесты, включая интеграционные. При падении в лог выводятся логи контейнеров.
-- `docker`: сборка образа и проверка, что контейнер не запускается от root. Кеш слоев хранится в GitHub Actions.
-
-CD (`.github/workflows/cd.yml`) публикует образ в `ghcr.io/nikolaykonkin/notification-service`:
-
-```bash
-docker pull ghcr.io/nikolaykonkin/notification-service:latest
-```
-
-Решения и особенности:
-
-- CI не имеет побочных эффектов и прав на запись, поэтому запускается для любого pull request. CD вынесен в отдельный workflow и запускается через `workflow_run` только после успешного CI на push в `main`, чтобы образ не уходил в реестр с непроверенного коммита и из pull request.
-- Для входа в реестр используется временный `GITHUB_TOKEN`. Право `packages: write` выдано только job-у публикации, у всего workflow права только на чтение.
-- Теги: `latest` (подвижный, перезаписывается) и `sha-<7 символов коммита>` (не перезаписывается, однозначно указывает на коммит). Образ связан с репозиторием меткой `org.opencontainers.image.source`, коммит записан в `org.opencontainers.image.revision`.
-- В контексте `workflow_run` переменная `GITHUB_SHA` указывает на последний коммит `main`, а не на проверенный CI, поэтому CD берет `head_sha` из события и собирает именно проверенный коммит. Блок `concurrency` выстраивает публикации в очередь, чтобы старая сборка не перезаписала `latest`.
-- Ограничения: образ публикуется только для `linux/amd64`; CD пересобирает образ из проверенного коммита (слои берутся из кеша), а не публикует тот же артефакт, который собрал CI; кеши `--mount=type=cache` Dockerfile (модули и сборка Go) в кеш слоев GitHub Actions не попадают, поэтому после изменения кода шаг `go build` в CI выполняется с нуля; образ не подписан и не сканируется на уязвимости.
+- **gRPC:** контракт в `.proto` и кодогенерация, валидация запросов, осмысленные коды ошибок (`InvalidArgument`, `NotFound`, `ResourceExhausted`, `Unavailable`), внутренние детали клиенту не раскрываются, тесты через bufconn.
+- **Kafka:** producer с ключом по `user_id` (порядок событий пользователя), consumer group, гарантия at-least-once (offset фиксируется после обработки), пропуск «отравленных» сообщений.
+- **Redis:** кеш по схеме cache-aside с TTL и сбросом при смене статуса; rate limiting (fixed window, `INCR` и `EXPIRE NX` в одной транзакции).
+- **PostgreSQL:** схема с ограничениями (`CHECK`, `JSONB`, `TIMESTAMPTZ`), параметризованные запросы, пул `pgxpool`.
+- **Надежность запуска и остановки:** конфигурация с fail-fast, проверка зависимостей на старте, graceful shutdown в порядке, обратном запуску, таймауты HTTP-сервера.
+- **Тесты:** unit-тесты с заглушками и интеграционные тесты с настоящими PostgreSQL, Redis и Kafka (сквозные сценарии: обработка, сбой отправки, лимит).
+- **Наблюдаемость:** метрики Prometheus (counter, histogram), `/health`, Grafana с дашбордом, описанным файлом в репозитории.
+- **Docker и CI/CD:** многоступенчатый образ без root, GitHub Actions (vet, тесты, интеграционные тесты, сборка образа), публикация образа в ghcr.io после зеленого CI.
+- **Честные ограничения:** раздел [Что не реализовано и почему](#что-не-реализовано-и-почему).
 
 ## Стек
 
-Используется сейчас:
-
 - Go 1.26
 - gRPC, Protocol Buffers (`protoc`, `protoc-gen-go`, `protoc-gen-go-grpc`)
-- PostgreSQL 17, драйвер pgx
-- Redis 7, клиент go-redis
-- Kafka 3.9 (KRaft, без ZooKeeper), клиент kafka-go
-- Prometheus (client_golang в сервисе, сервер в Docker Compose), Grafana
+- PostgreSQL 17, драйвер `jackc/pgx/v5`
+- Redis 7, клиент `redis/go-redis/v9`
+- Kafka 3.9 (KRaft, без ZooKeeper), клиент `segmentio/kafka-go`
+- Prometheus (`prometheus/client_golang` в сервисе, сервер в Docker Compose), Grafana
 - Docker, Docker Compose, GitHub Container Registry (ghcr.io)
 - GitHub Actions
 
-## Структура проекта
-
-```
-.
-├── cmd/notification-service/   точка входа: сборка зависимостей, запуск, graceful shutdown (готово)
-├── internal/
-│   ├── api/                    gRPC-сервер (готово)
-│   ├── cache/                  кеш уведомлений в Redis (готово)
-│   ├── config/                 конфигурация из env (готово)
-│   ├── httpserver/             HTTP: /metrics и /health (готово)
-│   ├── integration/            интеграционные тесты с настоящими сервисами (готово)
-│   ├── kafka/                  producer, consumer, проверка доступности (готово)
-│   ├── metrics/                метрики Prometheus (готово)
-│   ├── processor/              обработка события: отправка, статус, сброс кеша (готово)
-│   ├── ratelimit/              rate limiting на Redis (готово)
-│   └── storage/                репозиторий PostgreSQL (готово)
-├── migrations/                 001_init.sql
-├── monitoring/
-│   ├── prometheus/             конфигурация Prometheus
-│   └── grafana/                provisioning и дашборд Grafana
-├── proto/notification/v1/      контракт и сгенерированный код
-├── .github/workflows/
-│   ├── ci.yml                  проверки: vet, тесты, интеграционные тесты, образ
-│   └── cd.yml                  публикация образа в ghcr.io
-├── Dockerfile                  сборка образа сервиса
-├── .dockerignore
-├── docker-compose.yml          весь стенд
-├── Makefile
-└── .env.example                настройки для запуска из консоли (make run)
-```
-
 ## Быстрый старт
 
-Нужны Go 1.26, Docker и make. Сгенерированный protobuf-код лежит в репозитории, поэтому `protoc` нужен только для `make proto`.
+Для стенда нужны Docker и make, для вызовов [grpcurl](https://github.com/fullstorydev/grpcurl). Go 1.26 нужен только для тестов и запуска из консоли. Сгенерированный protobuf-код лежит в репозитории, поэтому `protoc` нужен только для `make proto`.
 
 Поднять весь стенд (при первом запуске собирается образ сервиса, это занимает пару минут):
 
@@ -180,25 +80,6 @@ docker compose ps -a
 
 Миграция из `migrations/` выполняется автоматически, но только при первом запуске на пустой базе. Чтобы применить ее заново, пересоздайте том: `docker compose down -v`, затем `make docker-up`.
 
-Вызвать сервис через [grpcurl](https://github.com/fullstorydev/grpcurl):
-
-```bash
-grpcurl -plaintext localhost:50051 list
-grpcurl -plaintext -d '{"user_id": 42, "type": "NOTIFICATION_TYPE_EMAIL", "payload": "{\"to\":\"user@example.com\"}"}' \
-  localhost:50051 notification.v1.NotificationService/SendNotification
-grpcurl -plaintext -d '{"id": "<id из ответа>"}' \
-  localhost:50051 notification.v1.NotificationService/GetNotification
-```
-
-Сразу после отправки статус `NOTIFICATION_STATUS_PENDING`, примерно через секунду `NOTIFICATION_STATUS_SENT`. Лимит по умолчанию 10 уведомлений в час на пользователя (`RATE_LIMIT_PER_HOUR`), сверх лимита сервис отвечает `ResourceExhausted`.
-
-Проверить состояние и метрики:
-
-```bash
-curl -s localhost:8080/health
-curl -s localhost:8080/metrics | grep notification
-```
-
 Запустить сервис из консоли вместо контейнера (например, для отладки). Порты 50051 и 8080 заняты контейнером, поэтому его нужно остановить:
 
 ```bash
@@ -207,28 +88,363 @@ docker compose stop notification-service
 make run
 ```
 
-Запустить тесты:
-
-```bash
-make vet
-make test
-```
-
-Без переменных окружения тесты PostgreSQL, Redis, Kafka и интеграционные пропускаются (`SKIP`). Чтобы выполнить все тесты с настоящими сервисами, одной командой:
-
-```bash
-make test-integration
-```
-
-Она поднимает PostgreSQL, Redis и Kafka из Docker Compose, создает топики, останавливает контейнер сервиса (он читает те же топики и мешал бы тестам) и запускает `go test -race -count=1 ./...`. Первый запуск дольше остальных: consumer ждет вступления в группу и обрабатывает накопленные сообщения. Вернуть сервис после тестов: `docker compose start notification-service`.
-
 Остановить стенд:
 
 ```bash
 make docker-down
 ```
 
-## Roadmap
+## Примеры вызовов
 
-- Полная версия README
-- Финальная проверка: `make vet`, `make test-race`, `docker compose up`, smoke-тест через grpcurl
+Reflection включен, поэтому grpcurl узнает схему у самого сервера. Адреса, id и время в ответах ниже примерные.
+
+Список сервисов:
+
+```bash
+grpcurl -plaintext localhost:50051 list
+```
+
+Создать уведомление (email):
+
+```bash
+grpcurl -plaintext -d '{"user_id": 42, "type": "NOTIFICATION_TYPE_EMAIL", "payload": "{\"to\":\"user@example.com\"}"}' \
+  localhost:50051 notification.v1.NotificationService/SendNotification
+```
+
+Ответ:
+
+```json
+{
+  "id": "8f0a8e0e-2f5d-4d2b-9a5e-2c5b5c8f5d1a",
+  "status": "NOTIFICATION_STATUS_PENDING"
+}
+```
+
+Создать уведомление (push):
+
+```bash
+grpcurl -plaintext -d '{"user_id": 42, "type": "NOTIFICATION_TYPE_PUSH", "payload": "{\"title\":\"hello\"}"}' \
+  localhost:50051 notification.v1.NotificationService/SendNotification
+```
+
+Получить уведомление по id:
+
+```bash
+grpcurl -plaintext -d '{"id": "<id из ответа>"}' \
+  localhost:50051 notification.v1.NotificationService/GetNotification
+```
+
+Ответ сразу после отправки, пока consumer не обработал событие:
+
+```json
+{
+  "notification": {
+    "id": "8f0a8e0e-2f5d-4d2b-9a5e-2c5b5c8f5d1a",
+    "userId": "42",
+    "type": "NOTIFICATION_TYPE_EMAIL",
+    "status": "NOTIFICATION_STATUS_PENDING",
+    "payload": "{\"to\": \"user@example.com\"}",
+    "createdAt": "2026-10-12T10:00:00Z",
+    "updatedAt": "2026-10-12T10:00:00Z"
+  }
+}
+```
+
+Примерно через секунду статус сменится на `NOTIFICATION_STATUS_SENT`. Поля `userId` и `createdAt` приходят в JSON строками: так protobuf представляет `int64` и `Timestamp`. Текст `payload` PostgreSQL возвращает в своей нормализованной форме (`JSONB`), поэтому после двоеточия может появиться пробел.
+
+Превышение лимита (11-й запрос за час на одного пользователя; лимит по умолчанию задается переменной `RATE_LIMIT_PER_HOUR`):
+
+```
+ERROR:
+  Code: ResourceExhausted
+  Message: превышен лимит уведомлений для пользователя
+```
+
+Невалидные `user_id`, `type` или `payload` (например, не JSON) отклоняются кодом `InvalidArgument`:
+
+```
+ERROR:
+  Code: InvalidArgument
+  Message: payload должен быть корректным JSON
+```
+
+Состояние и метрики:
+
+```bash
+curl -s localhost:8080/health
+curl -s localhost:8080/metrics | grep notification
+```
+
+`/health` отвечает `200`, если PostgreSQL и Redis доступны, и `503` иначе. Тело ответа в формате JSON, текст ошибок зависимостей в него не попадает.
+
+## Схема
+
+Сервис это один процесс: gRPC-сервер, HTTP-сервер (`/metrics`, `/health`), Kafka producer и Kafka consumer живут в нем вместе. Kafka здесь только транспорт между producer и consumer одного и того же процесса. Redis, PostgreSQL и Kafka внешние системы.
+
+```
+Отправка:
+
+клиент
+  |
+  | gRPC SendNotification
+  v
++------- notification-service (один процесс) --------+
+|                                                    |
+|  gRPC-сервер ---- проверка лимита -----------------|--> Redis
+|       |                                            |
+|       v                                            |
+|  producer -----------------------------------------|--> Kafka
+|                                                    |    notifications.email
+|                                                    |    notifications.push
+|  consumer <----------------------------------------|--- Kafka
+|       |                                            |
+|       +---- статус sent/failed --------------------|--> PostgreSQL
+|       +---- сброс кеша ----------------------------|--> Redis
+|                                                    |
++----------------------------------------------------+
+
+Чтение:
+
+  клиент --gRPC GetNotification--> notification-service --> Redis (кеш)
+                                                                | промах
+                                                                v
+                                                           PostgreSQL
+```
+
+Жизненный цикл уведомления: `pending` -> `sent` или `failed`. Принятое уведомление сразу получает статус `pending`, итоговый статус выставляет consumer после эмуляции отправки.
+
+## Как устроено
+
+### Контракт
+
+Файл `proto/notification/v1/notification.proto` описывает сервис `NotificationService` с двумя унарными методами: `SendNotification` (принять событие) и `GetNotification` (получить уведомление по id). Версия в имени пакета `notification.v1` позволит выпустить несовместимый `v2`, не сломав старых клиентов. У каждого метода своя пара запрос-ответ, чтобы методы развивались независимо. В `SendNotification` клиент передает `user_id`, `type` и `payload` (строка с JSON), в ответ приходит `id` и статус. Enum в proto3 открытый: у `NotificationType` нулевое значение `UNSPECIFIED` означает «тип не указан», а клиент может прислать и неизвестное число. Оба случая сервер отклоняет кодом `InvalidArgument`. Сгенерированный код лежит в репозитории (`make proto`), поэтому сборка не требует `protoc`.
+
+### Прием: SendNotification
+
+`SendNotification` (`internal/api/server.go`) выполняет шаги по порядку:
+
+1. Валидация (`internal/api/validate.go`): `user_id > 0`, тип только `EMAIL` или `PUSH`, `payload` непустой, не больше 64 KiB и валидный JSON. Ошибки это `InvalidArgument`.
+2. Проверка лимита (`internal/ratelimit`). Если лимит превышен, возвращается `ResourceExhausted`. Если Redis недоступен, запрос пропускается (fail-open) с записью в лог: защита вспомогательная, и ее сбой не должен останавливать основную функцию.
+3. Создание записи в PostgreSQL со статусом `pending` (`internal/storage`). Запись создается до публикации в Kafka осознанно: иначе consumer мог бы получить событие раньше, чем появится запись, не найти ее и пропустить.
+4. Публикация события в Kafka (`internal/kafka`). Если публикация не удалась, запись уже в базе со статусом `pending`, поэтому `markFailed` переводит ее в `failed` с причиной, а клиент получает `Unavailable`. `markFailed` использует `context.WithoutCancel` и таймаут 5 секунд: клиент мог уже отменить запрос, но пометить запись все равно нужно.
+
+Ответ клиенту: `id` и статус `PENDING`. Сама отправка выполняется асинхронно в consumer. Внутренние ошибки клиенту не раскрываются: подробности пишутся в лог, наружу уходит общий текст.
+
+### Ограничение частоты
+
+`internal/ratelimit` реализует fixed window на счетчике Redis: ключ `ratelimit:user:<id>`. `INCR` и `EXPIRE NX` отправляются одной транзакцией (`MULTI/EXEC` через `TxPipelined`), поэтому ключ не останется без TTL, а окно не продлевается последующими попытками. Отклоненная попытка тоже увеличивает счетчик: это безвредно, счетчик сбросится вместе с окном. Окно по умолчанию час (`ratelimit.DefaultWindow`), лимит берется из `RATE_LIMIT_PER_HOUR` (по умолчанию 10). Счетчик хранится в Redis, а не в памяти процесса, поэтому он общий для всех экземпляров сервиса и переживает перезапуск сервиса (но не перезапуск самого Redis: том в compose не задан).
+
+### Kafka: producer и consumer
+
+Producer (`internal/kafka/producer.go`) выбирает топик по типу уведомления: `notifications.email` или `notifications.push`. Ключ сообщения `user_id` в виде строки, балансировщик `Hash` отправляет один ключ в одну партицию, поэтому события одного пользователя сохраняют порядок. `RequiredAcks: RequireAll`: запись подтверждается всеми репликами. `BatchTimeout` уменьшен до 10 мс: `Publish` синхронный и иначе ждал бы секунду на каждый вызов. Топики создает одноразовый контейнер `kafka-init` в `docker-compose.yml`.
+
+Consumer (`internal/kafka/consumer.go`) читает оба топика в составе одной consumer group (`notification-service`): экземпляры с одним именем группы делят партиции. `FetchMessage` читает без автоматической фиксации offset, `CommitMessages` вызывается после успешной обработки. Отсюда гарантия доставки at-least-once: при сбое между обработкой и фиксацией событие придет повторно. Если `Handle` вернул ошибку, offset не фиксируется и consumer останавливается: offset хранит позицию всей партиции, и фиксация следующего сообщения пометила бы как обработанное и это, а оно было бы потеряно. Некорректный JSON или сообщение без `id` логируются и пропускаются: их разбор не удастся при любом числе повторов, и они не должны блокировать партицию.
+
+### Обработка событий
+
+`internal/processor` содержит бизнес-логику одного события. `Handle` по шагам:
+
+1. Эмуляция отправки через интерфейс `Sender`. Реализация `SimulatedSender` ждет `Delay` (в `main` 500 мс) или отмены контекста. `time.Sleep` не подходит: его нельзя прервать, и остановка сервиса ждала бы окончания паузы.
+2. Сохранение результата в PostgreSQL: `sent` без ошибки или `failed` с текстом ошибки. Неудачная отправка это нормальный результат, а не ошибка сервиса: событие не повторяется, статус просто `failed`.
+3. Метрики: `Processed` вызывается только после успешной записи статуса. Событие, которое придет повторно из-за ошибки записи или было пропущено, ни отправленным, ни проваленным не считается.
+4. Сброс записи в кеше по id. Сбой кеша не критичен: запись исчезнет сама по TTL.
+
+Особые случаи. Если контекст отменен (остановка сервиса), статус не меняется, ошибка возвращается наружу, consumer не фиксирует offset, событие обработается после перезапуска. Если `UpdateStatus` вернул `storage.ErrNotFound`, событие пропускается: повторять бессмысленно. Любая другая ошибка базы возвращается наружу: offset не фиксируется, consumer останавливается.
+
+### Выдача: GetNotification и кеш
+
+`GetNotification` (`internal/api/server.go`) сначала проверяет, что id похож на UUID (`validateID`): мусор не доходит ни до кеша, ни до базы. Затем читает из кеша (cache-aside, `internal/cache`): ключ `notification:<id>`, значение JSON, TTL по умолчанию 5 минут. При попадании отвечает из кеша. При промахе читает из PostgreSQL (`storage.GetByID`), кладет результат в кеш и отвечает. Если кеш недоступен, читает из базы: кеш нужен только для ускорения, данные хранятся в PostgreSQL. Отсутствие записи возвращается клиенту как `NotFound`, а не `Internal`.
+
+Устаревшее значение в кеше. После смены статуса процессор сбрасывает запись, поэтому обычно следующий читатель получает свежий статус. Остается узкая гонка: читатель успел прочитать из базы старый статус, consumer обновил статус и сбросил кеш, а читатель после этого положил в кеш старое значение. Тогда устаревший статус живет до истечения TTL (5 минут). Именно поэтому в интеграционных тестах ожидание статуса опрашивает PostgreSQL напрямую, а не `GetNotification`.
+
+### PostgreSQL
+
+Миграция `migrations/001_init.sql` создает таблицу `notifications`: `id UUID DEFAULT gen_random_uuid()`, `user_id BIGINT`, `type TEXT` с `CHECK` (email или push), `status TEXT` с `CHECK` (pending, sent или failed), `payload JSONB`, `error TEXT NOT NULL DEFAULT ''` (пустая строка вместо `NULL` проще для чтения), `created_at` и `updated_at` типа `TIMESTAMPTZ` со значением по умолчанию `now()`. Индексы: по `user_id`, `status` и `created_at`. Репозиторий (`internal/storage/repository.go`) использует только параметризованные запросы (`$1`, `$2`), что защищает от SQL-инъекций. Пул `pgxpool` проверяется через `Ping` на старте (fail-fast). Миграция применяется в compose через `docker-entrypoint-initdb.d`, но только на пустой базе.
+
+### HTTP: /metrics и /health
+
+`internal/httpserver` собирает маршруты через `http.ServeMux` с паттернами `GET /metrics` и `GET /health`: неправильный метод получает `405`, неизвестный путь `404`. `/health` проверяет `postgresql` и `redis` (`Ping`) с общим таймаутом 2 секунды: зависшая зависимость не должна подвесить эндпоинт. Ответ JSON `{"status":"ok"|"unavailable","checks":{"postgresql":"ok"|"fail","redis":"ok"|"fail"}}`, код `200` или `503`. Текст ошибки зависимости в ответ не попадает: эндпоинт не защищен, подробности пишутся в лог. `http.Server` создается с таймаутами `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout` и `IdleTimeout`: без них медленный клиент может держать соединение открытым сколь угодно долго (атака Slowloris).
+
+### Запуск и graceful shutdown
+
+`cmd/notification-service` это composition root: он собирает зависимости конструкторами (`storage.NewPool`, `cache.NewClient`, `kafka.NewProducer`, `processor.New`, `kafka.NewConsumer`, `api.New`) и запускает три горутины: consumer, gRPC-сервер и HTTP-сервер. На старте с таймаутом 15 секунд проверяются PostgreSQL, Redis и Kafka (TCP-подключение хотя бы к одному брокеру): без этого сервис запустился бы при выключенной инфраструктуре и молча простаивал. В gRPC-сервере включен reflection (`reflection.Register`), чтобы grpcurl узнавал схему без `.proto`-файла. В реальной эксплуатации reflection обычно отключают, потому что сервер раскрывает свою схему.
+
+Остановка по SIGINT или SIGTERM (`signal.NotifyContext`) идет в порядке, обратном запуску:
+
+1. HTTP-сервер: `Shutdown` с таймаутом 2 секунды, затем `Close`;
+2. gRPC-сервер: `GracefulStop` с таймаутом 5 секунд, затем `Stop`;
+3. consumer: отмена контекста, ожидание возврата из `Run`, затем `Close` (выход из группы);
+4. Kafka producer: `Close`;
+5. Redis: `Close`;
+6. PostgreSQL: `Close`.
+
+Docker после SIGTERM ждет 10 секунд и убивает процесс, поэтому 5 и 2 секунды в сумме укладываются. `stopGRPC` и `stopHTTP` покрыты тестами (`cmd/notification-service/shutdown_test.go`): и штатная остановка, и принудительная при зависшем стриме или запросе. Если consumer или один из серверов падают сами, без сигнала, `run` определяет это через `select` на каналах завершения, и процесс выходит с кодом 1. Docker Compose перезапускает такой контейнер (`restart: unless-stopped`).
+
+### Конфигурация
+
+`internal/config` читает переменные окружения и проверяет их на старте. Обязательные: `DATABASE_URL`, `REDIS_URL`, `KAFKA_BROKERS` (список через запятую). Необязательные: `GRPC_PORT` (50051), `HTTP_PORT` (8080), `RATE_LIMIT_PER_HOUR` (10). Ошибки собираются через `errors.Join`, чтобы пользователь увидел все проблемы за один запуск, а не по одной. Значения `DATABASE_URL` и `REDIS_URL` в текст ошибок не попадают: в них может быть пароль.
+
+## Тесты
+
+Уровни:
+
+- unit: логика с заглушками (`api`, `processor`, `metrics`, `httpserver`), выполняются за секунды без внешних сервисов;
+- integration: настоящие PostgreSQL, Redis и Kafka (`storage`, `cache`, `ratelimit`, `kafka` и сквозные сценарии в `internal/integration`);
+- e2e (запущенный контейнер, вызов по сети) не автоматизирован, это ручной smoke-тест через grpcurl.
+
+Команды:
+
+```bash
+make vet                # статический анализ
+make test               # тесты без внешних сервисов
+make test-race          # те же тесты с детектором гонок
+make test-integration   # все тесты с настоящими сервисами (-race -count=1)
+```
+
+`make test-integration` поднимает PostgreSQL, Redis и Kafka из Docker Compose, создает топики, останавливает контейнер сервиса (он читает те же топики и перезаписывал бы статусы) и запускает все тесты. Вернуть сервис после тестов: `docker compose start notification-service`. Первый запуск дольше остальных: consumer ждет вступления в группу и обрабатывает накопленные сообщения.
+
+Тесты, которым нужны внешние сервисы, пропускаются без переменных `TEST_DATABASE_URL`, `TEST_REDIS_URL` и `TEST_KAFKA_BROKERS`, поэтому обычный `go test ./...` работает везде. В CI интеграционные тесты выполняет отдельная задача.
+
+Особенности интеграционных тестов (`internal/integration`):
+
+- Сквозные сценарии: уведомление принято как `pending`, обработано асинхронно, устаревший статус из кеша сброшен; сбой отправки (`failed` с причиной); превышение лимита.
+- Отправка заменена управляемой заглушкой (`Sender` это интерфейс): она может задержать обработку выбранного пользователя, поэтому состояние `pending` и сброс кеша проверяются детерминированно, и может вернуть ошибку для проверки `failed`.
+- Результат асинхронной обработки ждут опросом с таймаутом, а не `sleep`. Ожидание статуса опрашивает PostgreSQL напрямую (причина описана в разделе [Выдача](#выдача-getnotification-и-кеш)).
+- Топики Kafka общие, поэтому у каждого теста свой `user_id`, а consumer group фиксированная, чтобы после первого запуска не перечитывать накопленные сообщения.
+- Результаты тестов с внешним состоянием не кешируются (`-count=1`).
+
+## Мониторинг
+
+Prometheus раз в 15 секунд забирает `/metrics` сервиса, Grafana рисует графики. Источник данных и дашборд `notification-service` описаны файлами в `monitoring/` и подключаются при старте Grafana (provisioning), поэтому после `make docker-up` дашборд появляется сам.
+
+Метрики сервиса (`internal/metrics`):
+
+- `notifications_sent_total` (counter, метка `type`): успешно отправленные уведомления;
+- `notifications_failed_total` (counter, метка `type`): уведомления, отправка которых завершилась ошибкой;
+- `notification_duration_seconds` (histogram, метка `type`): время обработки от начала `Handle` до записи статуса;
+- стандартные метрики Go (`go_goroutines`, память, сборщик мусора) и процесса.
+
+Решения и особенности:
+
+- Метрики регистрируются в отдельном реестре, а не в глобальном. Процессор не знает про Prometheus: он принимает интерфейс `Recorder`, реализация лежит в `internal/metrics`.
+- Метка `type` принимает только `email`, `push` и `unknown`: тип приходит из Kafka, и без ограничения мусорные значения создавали бы неограниченное число временных рядов (проблема кардинальности). Ряды для `email` и `push` создаются заранее, чтобы на графиках был ноль, а не «нет данных».
+- Дашборд хранится как JSON в git (`monitoring/grafana/dashboards/notification-service.json`). Он воспроизводим (не пропадает вместе с томом Grafana), его изменения видны в diff и откатываются. Минус: JSON многословный, запросы лежат внутри строк с экранированием.
+- Интерфейс Grafana для этого дашборда работает только на чтение (`allowUiUpdates: false`), иначе правка мышкой расходилась бы с файлом. Рабочий цикл: изменить панель в интерфейсе без сохранения, выгрузить через Export as JSON, заменить файл и закоммитить.
+- `uid` источника данных в `datasources/prometheus.yml` должен совпадать со ссылками в панелях, а смена `uid` дашборда создаст новый дашборд вместо обновления старого. Числовой `id` в файле не указывается: он локален для базы Grafana.
+- Квантили на дашборде оценочные: Prometheus хранит счетчики корзин гистограммы и предполагает равномерное распределение внутри корзины. Эмуляция отправки занимает около 0,5 с и попадает в корзину от 0,5 до 1 с, поэтому p50 на графике около 0,75 с. Для точных значений нужны корзины, подобранные под реальное время обработки.
+- Логин и пароль Grafana (`admin` / `admin`) заданы только для локального стенда, порты Prometheus и Grafana открыты лишь на `127.0.0.1`.
+
+## CI/CD
+
+CI (`.github/workflows/ci.yml`) запускается на push в `main` и на pull request, три задачи (job) идут параллельно:
+
+- `test`: `go vet`, `go test -race`, `go build`; тесты с внешними сервисами здесь пропускаются, зато результат приходит быстро;
+- `integration`: `make test-integration` (PostgreSQL, Redis и Kafka из `docker-compose.yml` и все тесты, включая интеграционные); при падении в лог выводятся логи контейнеров;
+- `docker`: сборка образа и проверка, что контейнер не запускается от root; кеш слоев хранится в GitHub Actions.
+
+CD (`.github/workflows/cd.yml`) публикует образ в `ghcr.io/nikolaykonkin/notification-service` после успешного CI на `main`:
+
+```bash
+docker pull ghcr.io/nikolaykonkin/notification-service:latest
+```
+
+Теги: `latest` (подвижный) и `sha-<7 символов коммита>` (не перезаписывается, однозначно указывает на коммит). Образ связан с репозиторием меткой `org.opencontainers.image.source`, а коммит записан в метку `org.opencontainers.image.revision`.
+
+Решения:
+
+- CI не имеет побочных эффектов и прав на запись, поэтому запускается для любого pull request. CD вынесен в отдельный workflow и запускается через `workflow_run` только после успешного CI на push в `main`: образ не уходит в реестр с непроверенного коммита и из pull request.
+- Вход в реестр выполняется временным `GITHUB_TOKEN`. Право `packages: write` выдано только задаче публикации, у остального workflow права только на чтение.
+- В контексте `workflow_run` переменная `GITHUB_SHA` указывает на последний коммит `main`, а не на проверенный CI, поэтому CD берет `head_sha` из события и собирает именно проверенный коммит.
+- Блок `concurrency` выстраивает публикации в очередь, чтобы старая сборка не перезаписала `latest`.
+
+## Структура проекта
+
+```
+.
+├── cmd/notification-service/   точка входа: сборка зависимостей, запуск, graceful shutdown
+├── internal/
+│   ├── api/                    gRPC-сервер: прием событий и выдача статусов
+│   ├── cache/                  кеш уведомлений в Redis
+│   ├── config/                 конфигурация из переменных окружения
+│   ├── httpserver/             HTTP: /metrics и /health
+│   ├── integration/            интеграционные тесты с настоящими сервисами
+│   ├── kafka/                  producer, consumer, проверка доступности
+│   ├── metrics/                метрики Prometheus
+│   ├── processor/              обработка события: отправка, статус, сброс кеша
+│   ├── ratelimit/              rate limiting на Redis
+│   └── storage/                репозиторий PostgreSQL
+├── migrations/                 001_init.sql
+├── monitoring/
+│   ├── prometheus/             конфигурация Prometheus
+│   └── grafana/                provisioning и дашборд Grafana
+├── proto/notification/v1/      контракт и сгенерированный код
+├── .github/workflows/
+│   ├── ci.yml                  проверки: vet, тесты, интеграционные тесты, образ
+│   └── cd.yml                  публикация образа в ghcr.io
+├── Dockerfile                  сборка образа сервиса
+├── .dockerignore
+├── docker-compose.yml          весь стенд
+├── Makefile
+└── .env.example                настройки для запуска из консоли (make run)
+```
+
+## Что не реализовано и почему
+
+Это пет-проект, и ниже перечислены осознанные упрощения. По каждому пункту указано, где ограничение проявляется в коде и что обычно делают в реальной системе.
+
+### Доставка и обработка событий
+
+- **At-least-once, а не exactly-once.** `internal/kafka/consumer.go` фиксирует offset после успешной обработки. При сбое между обработкой и фиксацией событие придет повторно.
+- **Dual write.** `SendNotification` (`internal/api/server.go`) делает две отдельные операции: запись в PostgreSQL (`store.Create`) и публикацию в Kafka (`publisher.Publish`). Общей транзакции нет. Если публикация не удалась, `markFailed` переводит запись в `failed`, но это компенсация, а не атомарность. Если процесс упадет между двумя операциями, или сам `markFailed` не выполнится (тогда в лог пишется только ошибка), запись останется в `pending` навсегда: фонового процесса, который искал бы зависшие записи, нет. **Outbox pattern** не реализован: нет таблицы `outbox` в `migrations/001_init.sql` и отдельного публикатора, который читал бы из базы и отправлял в Kafka. В реальной системе outbox и фоновая пересылка решают dual write.
+- **Повторная обработка не идемпотентна.** `processor.Handle` (`internal/processor/processor.go`) сначала эмулирует отправку, затем пишет статус. При повторной доставке `Sender.Send` вызовется снова, `UpdateStatus` перезапишет статус, а `Processed` повторно увеличит счетчик. Дедупликации по `id` нет. В реальной системе проверяют текущий статус перед обработкой, хранят ключи идемпотентности или полагаются на идемпотентность провайдера.
+- **Ошибка обработки останавливает consumer.** Если `Handle` вернул ошибку, offset не фиксируется и consumer останавливается. При постоянной ошибке (например, недоступна база) сообщение будет перечитываться после каждого перезапуска контейнера. **Повторы с нарастающей паузой (retry с backoff)** и **очередь недоставленных сообщений (DLQ)** не реализованы. В реальной системе сообщение уходит в DLQ после нескольких попыток, чтобы не блокировать партицию.
+- **«Отравленные» сообщения теряются.** Некорректный JSON или сообщение без `id` логируются и пропускаются (`consumer.go`, метод `process`). Это защищает партицию от блокировки, но без DLQ такие сообщения нигде не сохраняются.
+- **Consumer обрабатывает сообщения по одному.** С эмуляцией отправки в 500 мс это примерно два события в секунду на экземпляр. Масштабировать можно запуском новых экземпляров с тем же именем группы, но не больше числа партиций (по 3 на топик). Нагрузочных тестов нет.
+- **Kafka в compose это один брокер без репликации** (`replication-factor 1`) и без аутентификации. Подтверждение `RequireAll` на одной реплике мало что дает.
+
+### Кеш и ограничение частоты
+
+- **Устаревший статус в кеше.** В узкой гонке cache-aside (описана в разделе [Выдача](#выдача-getnotification-и-кеш)) устаревшее значение живет до истечения TTL, пять минут. Для сервиса статусов это допустимо, для чувствительных данных нет.
+- **Граница окна в rate limit.** Fixed window (`internal/ratelimit`) позволяет пользователю отправить N уведомлений в конце одного окна и еще N в начале следующего, то есть до 2N за короткое время. Точнее работают sliding window и token bucket, но они сложнее.
+- **Лимит только на пользователя и только на отправку.** Лимитера на общий поток запросов или на одновременные запросы нет. `GetNotification` лимитом не покрыт (`api/server.go`).
+- **При сбое Redis лимит не работает** (fail-open): выбрана доступность, а не защита. Обратное решение (fail-closed) остановило бы прием уведомлений при любом сбое Redis.
+- **Redis в compose без тома:** при перезапуске теряются кеш и счетчики лимитов (лимиты сбрасываются).
+
+### API и безопасность
+
+- **Нет аутентификации и авторизации.** `grpc.NewServer()` в `main.go` создается без интерсепторов и без проверки метаданных. Любой, кто дотянется до порта, может вызвать оба метода.
+- **Нет TLS.** Сервер создается без `grpc.Creds`. В реальной системе TLS настраивают на самом сервере или на уровне входящего прокси.
+- **Reflection включен.** Он раскрывает схему сервиса, в реальной эксплуатации его обычно отключают.
+- **`payload` это непрозрачная строка.** В `notification.proto` поле имеет тип `string`: так удобно, содержимое email и push разное. Сервер проверяет только, что это валидный JSON не больше 64 KiB (`internal/api/validate.go`), но не смысл полей. В реальной системе для каждого типа был бы свой контракт (`oneof` в proto) и своя валидация.
+- **Нет ключа идемпотентности.** Если клиент повторит `SendNotification` после таймаута, создастся второе уведомление.
+- **Нет метода списка уведомлений и пагинации.** В контракте только `SendNotification` и `GetNotification`, историю по пользователю через gRPC получить нельзя. Индексы по `user_id`, `status` и `created_at` в `migrations/001_init.sql` под такой метод заложены, самого метода нет.
+
+### Данные и миграции
+
+- **Нет инструмента миграций.** `migrations/001_init.sql` применяется через `docker-entrypoint-initdb.d` в `docker-compose.yml`, но только на пустой базе. Новые миграции к существующей базе автоматически не применяются. В реальной системе используют `golang-migrate`, `goose` или аналог.
+- **Нет очистки старых данных.** Таблица `notifications` только растет. В реальной системе задают срок хранения и удаляют или архивируют старые записи (иногда через партиционирование по времени).
+
+### Наблюдаемость
+
+- **Нет трассировки и интерцепторов.** В `main.go` нет `grpc.ChainUnaryInterceptor` и OpenTelemetry. Метрик по самим gRPC-запросам (число, ошибки, длительность по методам) тоже нет, только бизнес-метрики обработки.
+- **Бизнес-метрики неполные.** Отказы лимита (`ResourceExhausted`), ошибки публикации в Kafka и таймауты Redis в метрики не пишутся, только в лог. В реальной системе добавили бы счетчики по причинам отказа.
+- **Логи структурированные, но без идентификатора трассировки.** Используется `log/slog` с JSON в stdout. Корреляция запросов между gRPC, Kafka и процессором выполняется вручную.
+- **`/health` не проверяет Kafka** (`checks` в `main.go`: только `postgresql` и `redis`). Это сознательно: Kafka проверяется на старте (`kafka.Ping`), а падение consumer и так завершает процесс, и Docker его перезапускает. В реальной системе состояние Kafka обычно оценивают по отставанию consumer group.
+- **Prometheus и Grafana в compose это локальный стенд.** Пароли `admin`/`admin`, порты открыты на `127.0.0.1`. Для эксплуатации нужны отдельные решения: аутентификация, срок хранения метрик, алерты.
+
+### CI/CD и образ
+
+- **Образ собирается только под архитектуру раннера (linux/amd64)**: в cd.yml не задан platforms. На Apple Silicon он запускается через эмуляцию. Многоархитектурная сборка потребовала бы кросс-компиляции в Dockerfile и явного platforms в CD.
+- **CD пересобирает образ**, а не публикует тот, что собрал CI. Слои берутся из кеша, но формально образ не тот же самый: в строгой схеме CI передает артефакт, и CD его только выкладывает.
+- **Кеши `--mount=type=cache`** (модули и сборка Go) в кеш слоев GitHub Actions не попадают, поэтому после изменения кода шаг `go build` в CI выполняется с нуля.
+- **Образ не подписан и не проверяется на уязвимости.** В реальной системе добавляют подпись (например, cosign) и сканирование (например, Trivy).
+- **`latest` подвижный.** Для воспроизводимых развертываний нужно использовать тег `sha-...`.
+- **Метка раннера `ubuntu-latest` меняется сама**, без правок в репозитории. Для стабильности можно закрепить конкретную версию (например, `ubuntu-24.04`).
+
+### Осознанные границы проекта
+
+- **Отправка эмулируется.** `processor.SimulatedSender` (`internal/processor/sender.go`) просто ждет `Delay`. Реального провайдера (SMTP, FCM, APNs) нет. Интерфейс `Sender` готов к замене: реализация подставляется в `processor.New` без изменения остального кода.
+- **Один сервис в одном процессе**, без разделения на микросервисы и без API-шлюза.
+- **Только унарные gRPC-вызовы**, потоковых методов нет.
+- **Нет Kubernetes.** Стенд описан в Docker Compose.
+- **Нагрузочные тесты не проводились**, работа нескольких экземпляров сервиса не проверялась.
